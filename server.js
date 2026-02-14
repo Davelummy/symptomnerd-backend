@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import pg from "pg";
 import admin from "firebase-admin";
+import twilio from "twilio";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -28,6 +29,14 @@ const NEON_DATABASE_URL = process.env.NEON_DATABASE_URL;
 const LOG_AI_REQUESTS = process.env.LOG_AI_REQUESTS === "true";
 const PHARMACIST_USER = process.env.PHARMACIST_USER;
 const PHARMACIST_PASS = process.env.PHARMACIST_PASS;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_API_KEY = process.env.TWILIO_API_KEY;
+const TWILIO_API_SECRET = process.env.TWILIO_API_SECRET;
+const TWILIO_TWIML_APP_SID = process.env.TWILIO_TWIML_APP_SID;
+const TWILIO_PHARMACIST_IDENTITY = process.env.TWILIO_PHARMACIST_IDENTITY || "pharmacist_console";
+
+const { AccessToken } = twilio.jwt;
+const { VoiceGrant } = AccessToken;
 
 let pool;
 let dbInitPromise;
@@ -75,6 +84,10 @@ if (LOG_AI_REQUESTS && !NEON_DATABASE_URL) {
 
 if (!PHARMACIST_USER || !PHARMACIST_PASS) {
   console.warn("Missing PHARMACIST_USER/PHARMACIST_PASS. Pharmacist console will be locked.");
+}
+
+if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET || !TWILIO_TWIML_APP_SID) {
+  console.warn("Twilio Voice is not fully configured. Live in-app calls will be disabled.");
 }
 
 const responseSchema = {
@@ -193,6 +206,36 @@ function serializeDoc(doc) {
   return { id: doc.id, ...serializeValue(data) };
 }
 
+function isTwilioConfigured() {
+  return Boolean(TWILIO_ACCOUNT_SID && TWILIO_API_KEY && TWILIO_API_SECRET && TWILIO_TWIML_APP_SID);
+}
+
+function sanitizeIdentity(identity, fallback = "") {
+  const cleaned = String(identity || "")
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]/g, "_")
+    .slice(0, 120);
+  return cleaned || fallback;
+}
+
+function createTwilioVoiceToken(identity) {
+  const token = new AccessToken(TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, {
+    identity
+  });
+  const voiceGrant = new VoiceGrant({
+    outgoingApplicationSid: TWILIO_TWIML_APP_SID,
+    incomingAllow: true
+  });
+  token.addGrant(voiceGrant);
+  return token.toJwt();
+}
+
+function extractBearerToken(req) {
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Bearer ")) return null;
+  return header.slice("Bearer ".length).trim();
+}
+
 app.use("/pharmacist", requirePharmacistAuth, express.static(publicDir));
 app.get("/pharmacist", requirePharmacistAuth, (req, res) => {
   res.sendFile(path.join(publicDir, "pharmacist.html"));
@@ -301,6 +344,77 @@ app.post("/pharmacist/api/calls/:id/status", async (req, res) => {
     res.status(500).json({ error: err?.message || "Failed to update call status." });
   }
 });
+
+app.post("/pharmacist/api/twilio/token", async (_req, res) => {
+  try {
+    if (!isTwilioConfigured()) {
+      return res.status(500).json({ error: "Twilio Voice not configured." });
+    }
+    const identity = sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console");
+    const token = createTwilioVoiceToken(identity);
+    return res.json({ token, identity });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || "Failed to create Twilio token." });
+  }
+});
+
+app.post("/twilio/access-token", ensureFirebase, async (req, res) => {
+  try {
+    if (!isTwilioConfigured()) {
+      return res.status(500).json({ error: "Twilio Voice not configured." });
+    }
+
+    const idToken = extractBearerToken(req);
+    if (!idToken) {
+      return res.status(401).json({ error: "Missing Firebase ID token." });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const identity = sanitizeIdentity(`user_${uid}`, `user_${Date.now()}`);
+    const displayName = (decoded.name || decoded.email || `User ${uid.slice(0, 6)}`).toString().slice(0, 80);
+    const token = createTwilioVoiceToken(identity);
+
+    return res.json({
+      token,
+      identity,
+      displayName,
+      pharmacistIdentity: sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console")
+    });
+  } catch (err) {
+    return res.status(401).json({ error: err?.message || "Invalid Firebase ID token." });
+  }
+});
+
+app.post("/twilio/voice", express.urlencoded({ extended: false }), (req, res) => {
+  if (!isTwilioConfigured()) {
+    return res.status(500).type("text/plain").send("Twilio Voice is not configured.");
+  }
+
+  const requestedTo = sanitizeIdentity(req.body?.To || req.query?.to, "");
+  const callerIdentity = sanitizeIdentity(req.body?.From || req.body?.Caller || "", "");
+  const callerName = String(req.body?.CallerName || req.body?.callerName || "")
+    .trim()
+    .slice(0, 80);
+  const targetIdentity = requestedTo || sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console");
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  const dial = twiml.dial({
+    answerOnBridge: true
+  });
+  const client = dial.client();
+  client.identity(targetIdentity);
+
+  if (callerName) {
+    client.parameter({ name: "callerName", value: callerName });
+  }
+  if (callerIdentity) {
+    client.parameter({ name: "callerIdentity", value: callerIdentity });
+  }
+
+  return res.type("text/xml").send(twiml.toString());
+});
+
 async function ensureDb() {
   const pool = getPool();
   if (!pool) return;

@@ -270,6 +270,19 @@ textarea {
   margin-top: 8px;
 }
 
+.live-call {
+  border: 1px solid #2a3240;
+  border-radius: 12px;
+  padding: 12px;
+  background: #101621;
+  margin-bottom: 10px;
+}
+
+.live-call.ringing {
+  border-color: #f6c955;
+  box-shadow: 0 0 0 1px rgba(246, 201, 85, 0.35);
+}
+
 @media (max-width: 1100px) {
   .grid {
     grid-template-columns: 1fr;

@@ -14,6 +14,7 @@
         <p class="subtitle">Triage chats and call requests.</p>
       </div>
       <div class="meta">
+        <span id="voiceStatusBadge" class="badge">Voice offline</span>
         <span id="incomingBadge" class="badge">No incoming calls</span>
         <span id="lastRefresh">Last refresh: --</span>
         <button id="refreshBtn">Refresh</button>
@@ -61,11 +62,21 @@
             <option value="cancelled">Cancelled</option>
           </select>
         </div>
+        <div id="liveCallCard" class="live-call">
+          <div id="liveCallTitle" class="title">Live call line is starting…</div>
+          <div id="liveCallMeta" class="meta">The pharmacist browser line must stay open to receive calls.</div>
+          <div class="call-actions">
+            <button id="answerCallBtn" disabled>Answer</button>
+            <button id="rejectCallBtn" disabled>Decline</button>
+            <button id="hangupCallBtn" disabled>Hang up</button>
+          </div>
+        </div>
         <ul id="callsList" class="list"></ul>
       </section>
     </main>
   </div>
 
+  <script src="https://unpkg.com/@twilio/voice-sdk@2.16.0/dist/twilio.min.js"></script>
   <script src="/pharmacist/pharmacist.js"></script>
 </body>
 </html>

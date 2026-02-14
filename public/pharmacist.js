@@ -22,10 +22,20 @@ const lastRefresh = document.getElementById("lastRefresh");
 const sessionSearch = document.getElementById("sessionSearch");
 const callStatusFilter = document.getElementById("callStatusFilter");
 const incomingBadge = document.getElementById("incomingBadge");
+const voiceStatusBadge = document.getElementById("voiceStatusBadge");
+const liveCallCard = document.getElementById("liveCallCard");
+const liveCallTitle = document.getElementById("liveCallTitle");
+const liveCallMeta = document.getElementById("liveCallMeta");
+const answerCallBtn = document.getElementById("answerCallBtn");
+const rejectCallBtn = document.getElementById("rejectCallBtn");
+const hangupCallBtn = document.getElementById("hangupCallBtn");
 
 let audioContext;
 let titlePulseInterval;
 const baseDocumentTitle = document.title;
+let device = null;
+let activeVoiceCall = null;
+let incomingVoiceCall = null;
 
 const api = async (path, options = {}) => {
   const response = await fetch(`/pharmacist/api${path}`, {
@@ -107,7 +117,6 @@ const ringIncoming = () => {
       oscillator.frequency.value = 988;
       oscillator.connect(gain);
       gain.connect(audioContext.destination);
-
       const now = audioContext.currentTime + delay;
       gain.gain.setValueAtTime(0.0001, now);
       gain.gain.exponentialRampToValueAtTime(0.15, now + 0.01);
@@ -120,15 +129,195 @@ const ringIncoming = () => {
   }
 };
 
+const setVoiceBadge = (text, mode) => {
+  voiceStatusBadge.textContent = text;
+  voiceStatusBadge.classList.remove("incoming", "danger");
+  if (mode === "incoming") {
+    voiceStatusBadge.classList.add("incoming");
+  } else if (mode === "danger") {
+    voiceStatusBadge.classList.add("danger");
+  }
+};
+
+const setLiveCallUI = ({ title, meta, ringing = false, canAnswer = false, canReject = false, canHangup = false }) => {
+  liveCallTitle.textContent = title;
+  liveCallMeta.textContent = meta;
+  liveCallCard.classList.toggle("ringing", ringing);
+  answerCallBtn.disabled = !canAnswer;
+  rejectCallBtn.disabled = !canReject;
+  hangupCallBtn.disabled = !canHangup;
+};
+
+const callerLabelFromCall = (call) => {
+  const custom = call.customParameters;
+  const callerName = custom?.get ? custom.get("callerName") : null;
+  const callerIdentity = custom?.get ? custom.get("callerIdentity") : null;
+  return callerName || callerIdentity || call.parameters?.From || "Unknown caller";
+};
+
+const wireCallLifecycle = (call) => {
+  call.on("accept", () => {
+    activeVoiceCall = call;
+    incomingVoiceCall = null;
+    setVoiceBadge("Live connected", "incoming");
+    setLiveCallUI({
+      title: "Live call connected",
+      meta: `Talking to ${callerLabelFromCall(call)}`,
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: true
+    });
+  });
+
+  call.on("disconnect", () => {
+    activeVoiceCall = null;
+    incomingVoiceCall = null;
+    setVoiceBadge("Voice online", "");
+    setLiveCallUI({
+      title: "No active live call",
+      meta: "Waiting for incoming pharmacist calls from users.",
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: false
+    });
+    refreshIncomingBadge();
+  });
+
+  call.on("cancel", () => {
+    incomingVoiceCall = null;
+    setVoiceBadge("Voice online", "");
+    setLiveCallUI({
+      title: "Missed incoming call",
+      meta: "Caller hung up before answer.",
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: false
+    });
+    refreshIncomingBadge();
+  });
+
+  call.on("reject", () => {
+    incomingVoiceCall = null;
+    setVoiceBadge("Voice online", "");
+  });
+
+  call.on("error", (error) => {
+    console.error("Twilio call error:", error);
+    setVoiceBadge("Voice error", "danger");
+    setLiveCallUI({
+      title: "Voice call error",
+      meta: error?.message || "Unknown call error.",
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: false
+    });
+  });
+};
+
+const refreshTwilioToken = async () => {
+  if (!device) return;
+  const payload = await api("/twilio/token", { method: "POST", body: "{}" });
+  if (payload?.token) {
+    await device.updateToken(payload.token);
+  }
+};
+
+const setupVoiceDevice = async () => {
+  const DeviceClass = window.Twilio?.Device || window.Device;
+  if (!DeviceClass) {
+    setVoiceBadge("Voice SDK missing", "danger");
+    setLiveCallUI({
+      title: "Voice SDK missing",
+      meta: "Twilio browser SDK did not load.",
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: false
+    });
+    return;
+  }
+
+  try {
+    const payload = await api("/twilio/token", { method: "POST", body: "{}" });
+    device = new DeviceClass(payload.token, {
+      closeProtection: true,
+      codecPreferences: ["opus", "pcmu"]
+    });
+
+    device.on("registered", () => {
+      setVoiceBadge("Voice online", "");
+      setLiveCallUI({
+        title: "No active live call",
+        meta: "Waiting for incoming pharmacist calls from users.",
+        ringing: false,
+        canAnswer: false,
+        canReject: false,
+        canHangup: false
+      });
+    });
+
+    device.on("incoming", (call) => {
+      incomingVoiceCall = call;
+      wireCallLifecycle(call);
+      const caller = callerLabelFromCall(call);
+      setVoiceBadge("Incoming live call", "incoming");
+      setLiveCallUI({
+        title: "Incoming live call",
+        meta: `Caller: ${caller}`,
+        ringing: true,
+        canAnswer: true,
+        canReject: true,
+        canHangup: false
+      });
+      ringIncoming();
+      startTitlePulse();
+    });
+
+    device.on("error", (error) => {
+      console.error("Twilio device error:", error);
+      setVoiceBadge("Voice error", "danger");
+      setLiveCallUI({
+        title: "Voice line disconnected",
+        meta: error?.message || "Unable to register Twilio voice line.",
+        ringing: false,
+        canAnswer: false,
+        canReject: false,
+        canHangup: false
+      });
+      stopTitlePulse();
+    });
+
+    device.on("tokenWillExpire", refreshTwilioToken);
+    await device.register();
+  } catch (error) {
+    console.error("Failed to initialize Twilio voice:", error);
+    setVoiceBadge("Voice unavailable", "danger");
+    setLiveCallUI({
+      title: "Voice setup failed",
+      meta: error?.message || "Could not start pharmacist voice line.",
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: false
+    });
+  }
+};
+
 const refreshIncomingBadge = () => {
   const requestedCount = state.calls.filter((call) => call.status === "requested").length;
-  if (!requestedCount) {
+  const hasVoiceIncoming = Boolean(incomingVoiceCall);
+  const totalIncoming = requestedCount + (hasVoiceIncoming ? 1 : 0);
+  if (!totalIncoming) {
     incomingBadge.textContent = "No incoming calls";
     incomingBadge.classList.remove("incoming");
     stopTitlePulse();
     return;
   }
-  incomingBadge.textContent = `${requestedCount} incoming call${requestedCount === 1 ? "" : "s"}`;
+  incomingBadge.textContent = `${totalIncoming} incoming call${totalIncoming === 1 ? "" : "s"}`;
   incomingBadge.classList.add("incoming");
   startTitlePulse();
 };
@@ -256,7 +445,6 @@ const loadCalls = async () => {
 
   state.requestedCallIds = currentRequested;
   state.callsHydrated = true;
-
   renderCalls();
   refreshIncomingBadge();
 };
@@ -302,9 +490,50 @@ saveStatusBtn.addEventListener("click", async () => {
   await refreshAll();
 });
 
+answerCallBtn.addEventListener("click", async () => {
+  if (!incomingVoiceCall) return;
+  try {
+    await incomingVoiceCall.accept();
+  } catch (error) {
+    console.error("Failed to accept call:", error);
+  }
+});
+
+rejectCallBtn.addEventListener("click", () => {
+  if (!incomingVoiceCall) return;
+  incomingVoiceCall.reject();
+  incomingVoiceCall = null;
+  setVoiceBadge("Voice online", "");
+  setLiveCallUI({
+    title: "Call declined",
+    meta: "Waiting for incoming pharmacist calls from users.",
+    ringing: false,
+    canAnswer: false,
+    canReject: false,
+    canHangup: false
+  });
+  refreshIncomingBadge();
+});
+
+hangupCallBtn.addEventListener("click", () => {
+  if (!activeVoiceCall) return;
+  activeVoiceCall.disconnect();
+});
+
 refreshBtn.addEventListener("click", refreshAll);
 callStatusFilter.addEventListener("change", renderCalls);
 sessionSearch.addEventListener("input", renderSessions);
 
+setVoiceBadge("Starting voice line…", "");
+setLiveCallUI({
+  title: "Live call line is starting…",
+  meta: "Fetching Twilio token and registering browser device.",
+  ringing: false,
+  canAnswer: false,
+  canReject: false,
+  canHangup: false
+});
+
+setupVoiceDevice();
 refreshAll();
 setInterval(refreshAll, 5000);
