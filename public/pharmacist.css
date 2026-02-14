@@ -146,6 +146,11 @@ textarea {
   font-size: 12px;
 }
 
+.list-item.incoming {
+  border-color: #f6c955;
+  box-shadow: 0 0 0 1px rgba(246, 201, 85, 0.35);
+}
+
 .chat {
   min-height: 70vh;
 }
@@ -220,9 +225,43 @@ textarea {
   color: var(--muted);
 }
 
+.badge.incoming {
+  border-color: #f6c955;
+  color: #f6c955;
+}
+
 .badge.danger {
   border-color: var(--danger);
   color: var(--danger);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 600;
+  padding: 4px 8px;
+  margin-left: 6px;
+}
+
+.pill.new {
+  color: #4cd493;
+  background: rgba(76, 212, 147, 0.14);
+  border: 1px solid rgba(76, 212, 147, 0.35);
+}
+
+.pill.returning {
+  color: #8acbff;
+  background: rgba(138, 203, 255, 0.14);
+  border: 1px solid rgba(138, 203, 255, 0.35);
+}
+
+.pill.requested {
+  color: #f6c955;
+  background: rgba(246, 201, 85, 0.16);
+  border: 1px solid rgba(246, 201, 85, 0.4);
 }
 
 .call-actions {
