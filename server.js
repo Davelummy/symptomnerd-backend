@@ -1,0 +1,809 @@
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import pg from "pg";
+import admin from "firebase-admin";
+import path from "path";
+import { fileURLToPath } from "url";
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
+
+const { Pool } = pg;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const publicDir = path.join(__dirname, "public");
+
+const PORT = process.env.PORT || 3001;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const AI_PROVIDER = process.env.AI_PROVIDER || (GEMINI_API_KEY ? "gemini" : "openai");
+const NEON_DATABASE_URL = process.env.NEON_DATABASE_URL;
+const LOG_AI_REQUESTS = process.env.LOG_AI_REQUESTS === "true";
+const PHARMACIST_USER = process.env.PHARMACIST_USER;
+const PHARMACIST_PASS = process.env.PHARMACIST_PASS;
+
+let pool;
+let dbInitPromise;
+let firestore;
+let firebaseReady = false;
+
+function initFirebaseAdmin() {
+  if (firebaseReady) return true;
+  if (admin.apps.length) {
+    firestore = admin.firestore();
+    firebaseReady = true;
+    return true;
+  }
+
+  try {
+    const serviceAccountJSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (serviceAccountJSON) {
+      admin.initializeApp({
+        credential: admin.credential.cert(JSON.parse(serviceAccountJSON))
+      });
+    } else {
+      admin.initializeApp();
+    }
+    firestore = admin.firestore();
+    firebaseReady = true;
+    return true;
+  } catch (err) {
+    console.warn("Firebase Admin not configured:", err?.message || err);
+    firebaseReady = false;
+    return false;
+  }
+}
+
+if (!OPENAI_API_KEY && AI_PROVIDER === "openai") {
+  console.warn("Missing OPENAI_API_KEY. Set it in .env before calling /ai endpoints.");
+}
+
+if (!GEMINI_API_KEY && AI_PROVIDER === "gemini") {
+  console.warn("Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Set it in .env before calling /ai endpoints.");
+}
+
+if (LOG_AI_REQUESTS && !NEON_DATABASE_URL) {
+  console.warn("LOG_AI_REQUESTS=true but NEON_DATABASE_URL is missing. Skipping DB logging.");
+}
+
+if (!PHARMACIST_USER || !PHARMACIST_PASS) {
+  console.warn("Missing PHARMACIST_USER/PHARMACIST_PASS. Pharmacist console will be locked.");
+}
+
+const responseSchema = {
+  type: "object",
+  properties: {
+    recap: { type: "string" },
+    patterns: { type: "array", items: { type: "string" } },
+    suggestions: { type: "array", items: { type: "string" } },
+    redFlags: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          title: { type: "string" },
+          whyItMatters: { type: "string" },
+          action: { type: "string" }
+        },
+        required: ["title", "whyItMatters", "action"]
+      }
+    },
+    questionsForClinician: { type: "array", items: { type: "string" } },
+    disclaimer: { type: "string" }
+  },
+  required: ["recap", "patterns", "suggestions", "redFlags", "questionsForClinician", "disclaimer"]
+};
+
+const geminiResponseSchema = {
+  type: "object",
+  properties: {
+    recap: { type: "string" },
+    patterns: { type: "array", items: { type: "string" } },
+    suggestions: { type: "array", items: { type: "string" } },
+    redFlags: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          whyItMatters: { type: "string" },
+          action: { type: "string" }
+        },
+        required: ["title", "whyItMatters", "action"]
+      }
+    },
+    questionsForClinician: { type: "array", items: { type: "string" } },
+    disclaimer: { type: "string" }
+  },
+  required: ["recap", "patterns", "suggestions", "redFlags", "questionsForClinician", "disclaimer"]
+};
+
+const systemPrompt = `You are Symptom Nerd AI. Provide informational, pattern-based insights only.\n- Do not diagnose, prescribe, or claim certainty.\n- Do not provide medication dosing or specific treatment instructions.\n- If no logs are provided, focus on the user's question only.\n- Recap MUST explicitly mention the user's question and any logged symptom types.\n- Start recap with: "You asked about ..." or "You asked: ..."\n- Use the user's exact symptom words when possible.\n- Include emergency guidance when relevant: "If you think this may be an emergency, call your local emergency number."\n- Output must strictly match the JSON schema.\n- Keep tone calm and non-alarming.`;
+
+function getPool() {
+  if (!LOG_AI_REQUESTS || !NEON_DATABASE_URL) return null;
+  if (!pool) {
+    pool = new Pool({
+      connectionString: NEON_DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    });
+  }
+  return pool;
+}
+
+function requirePharmacistAuth(req, res, next) {
+  if (!PHARMACIST_USER || !PHARMACIST_PASS) {
+    return res.status(500).json({ error: "Pharmacist console not configured." });
+  }
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Basic ")) {
+    res.setHeader("WWW-Authenticate", "Basic");
+    return res.status(401).send("Authentication required.");
+  }
+  const base64 = header.replace("Basic ", "");
+  const decoded = Buffer.from(base64, "base64").toString("utf8");
+  const [user, pass] = decoded.split(":");
+  if (user !== PHARMACIST_USER || pass !== PHARMACIST_PASS) {
+    return res.status(403).send("Invalid credentials.");
+  }
+  return next();
+}
+
+function ensureFirebase(req, res, next) {
+  if (!firestore || !firebaseReady) {
+    const ok = initFirebaseAdmin();
+    if (!ok) {
+      return res.status(500).json({ error: "Firebase Admin not configured." });
+    }
+  }
+  return next();
+}
+
+function serializeValue(value) {
+  if (!value) return value;
+  if (typeof value.toDate === "function") {
+    return value.toDate().toISOString();
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => serializeValue(item));
+  }
+  if (typeof value === "object") {
+    const nested = {};
+    for (const [key, item] of Object.entries(value)) {
+      nested[key] = serializeValue(item);
+    }
+    return nested;
+  }
+  return value;
+}
+
+function serializeDoc(doc) {
+  const data = doc.data() || {};
+  return { id: doc.id, ...serializeValue(data) };
+}
+
+app.use("/pharmacist", requirePharmacistAuth, express.static(publicDir));
+app.get("/pharmacist", requirePharmacistAuth, (req, res) => {
+  res.sendFile(path.join(publicDir, "pharmacist.html"));
+});
+
+app.use("/pharmacist/api", requirePharmacistAuth, ensureFirebase);
+
+app.get("/pharmacist/api/sessions", async (req, res) => {
+  try {
+    const snapshot = await firestore
+      .collection("pharmacist_sessions")
+      .orderBy("updatedAt", "desc")
+      .limit(100)
+      .get();
+    const sessions = snapshot.docs.map(serializeDoc);
+    res.json({ sessions });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to load sessions." });
+  }
+});
+
+app.get("/pharmacist/api/sessions/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const snapshot = await firestore
+      .collection("pharmacist_sessions")
+      .doc(id)
+      .collection("messages")
+      .orderBy("createdAt", "asc")
+      .get();
+    const messages = snapshot.docs.map(serializeDoc);
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to load messages." });
+  }
+});
+
+app.post("/pharmacist/api/sessions/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const content = (req.body?.content || "").trim();
+    if (!content) {
+      return res.status(400).json({ error: "Message content is required." });
+    }
+    const messageId = firestore.collection("noop").doc().id;
+    const message = {
+      id: messageId,
+      role: "pharmacist",
+      content,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const sessionRef = firestore.collection("pharmacist_sessions").doc(id);
+    await sessionRef.collection("messages").doc(messageId).set(message);
+    await sessionRef.update({
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      statusText: "Pharmacist replied"
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to send message." });
+  }
+});
+
+app.post("/pharmacist/api/sessions/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const statusText = req.body?.statusText || null;
+    const queuePosition = req.body?.queuePosition ?? null;
+    await firestore.collection("pharmacist_sessions").doc(id).update({
+      statusText,
+      queuePosition,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to update status." });
+  }
+});
+
+app.get("/pharmacist/api/calls", async (req, res) => {
+  try {
+    const snapshot = await firestore
+      .collection("pharmacist_call_requests")
+      .orderBy("createdAt", "desc")
+      .limit(100)
+      .get();
+    const calls = snapshot.docs.map(serializeDoc);
+    res.json({ calls });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to load calls." });
+  }
+});
+
+app.post("/pharmacist/api/calls/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const status = req.body?.status || "in_progress";
+    await firestore.collection("pharmacist_call_requests").doc(id).update({
+      status,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to update call status." });
+  }
+});
+async function ensureDb() {
+  const pool = getPool();
+  if (!pool) return;
+  if (!dbInitPromise) {
+    dbInitPromise = pool.query(`
+      CREATE TABLE IF NOT EXISTS ai_requests (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        provider TEXT,
+        endpoint TEXT,
+        user_question TEXT,
+        entry_count INT,
+        payload JSONB,
+        response JSONB,
+        success BOOLEAN,
+        error TEXT
+      );
+    `);
+  }
+  await dbInitPromise;
+}
+
+async function logAIRequest({ provider, endpoint, payload, response, success, error }) {
+  try {
+    const pool = getPool();
+    if (!pool) return;
+    await ensureDb();
+    const entryCount = Array.isArray(payload?.entries) ? payload.entries.length : 0;
+    const userQuestion = payload?.userQuestion ?? null;
+    await pool.query(
+      `INSERT INTO ai_requests (provider, endpoint, user_question, entry_count, payload, response, success, error)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8);`,
+      [
+        provider,
+        endpoint,
+        userQuestion,
+        entryCount,
+        payload || null,
+        response || null,
+        success ?? null,
+        error ?? null
+      ]
+    );
+  } catch (err) {
+    console.warn("Failed to log AI request:", err?.message || err);
+  }
+}
+
+function buildUserPayload(request) {
+  const { entries, timeframe, userPrefs, locale, timezone, userQuestion } = request || {};
+
+  const sanitizedEntries = Array.isArray(entries)
+    ? entries.map((entry) => ({
+        id: entry.id,
+        symptomType: entry.symptomType,
+        severity: entry.severity,
+        onset: entry.onset ?? null,
+        durationMinutes: entry.durationMinutes ?? null,
+        triggers: entry.triggers ?? [],
+        notes: entry.notes ?? null,
+        sleepHours: userPrefs?.dataMinimizationOn ? null : entry.sleepHours ?? null,
+        hydrationLiters: userPrefs?.dataMinimizationOn ? null : entry.hydrationLiters ?? null,
+        caffeineMg: userPrefs?.dataMinimizationOn ? null : entry.caffeineMg ?? null,
+        alcoholUnits: userPrefs?.dataMinimizationOn ? null : entry.alcoholUnits ?? null
+      }))
+    : [];
+
+  return {
+    userQuestion: userQuestion || "Analyze my logs",
+    timeframe,
+    locale,
+    timezone,
+    userPrefs,
+    entries: sanitizedEntries
+  };
+}
+
+async function callOpenAI(input) {
+  if (!OPENAI_API_KEY) {
+    return { error: "Missing OPENAI_API_KEY" };
+  }
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      input,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "SymptomNerdAIResponse",
+          schema: responseSchema,
+          strict: true
+        }
+      }
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    const message = data?.error?.message || "OpenAI error";
+    throw new Error(message);
+  }
+
+  const outputText = data.output_text || data.output?.[0]?.content?.[0]?.text;
+  if (!outputText) {
+    throw new Error("No output_text returned from OpenAI");
+  }
+
+  return JSON.parse(outputText);
+}
+
+async function callGemini(contents, payload, useSchema = true) {
+  if (!GEMINI_API_KEY) {
+    return fallbackResponse("Missing GEMINI_API_KEY", payload);
+  }
+
+  const body = useSchema
+    ? {
+        system_instruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents,
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: geminiResponseSchema
+        }
+      }
+    : {
+        system_instruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents
+      };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      }
+    );
+
+    const data = await response.json();
+    if (!response.ok) {
+      const message =
+        data?.error?.message ||
+        data?.error?.status ||
+        "Gemini error";
+      if (useSchema && /responseMimeType|responseSchema/i.test(message)) {
+        return callGemini(contents, payload, false);
+      }
+      return fallbackResponse(message, payload);
+    }
+
+    const outputText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!outputText) {
+      return fallbackResponse("No output text returned from Gemini", payload);
+    }
+
+    return normalizeAIResponse(parseJsonResponse(outputText, payload), payload);
+  } catch (error) {
+    const message = error?.name === "AbortError" ? "Gemini request timed out" : error?.message || "Gemini error";
+    return fallbackResponse(message, payload);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseJsonResponse(text, payload) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start !== -1 && end !== -1 && end > start) {
+      const slice = text.slice(start, end + 1);
+      return JSON.parse(slice);
+    }
+    return fallbackResponse(text, payload);
+  }
+}
+
+function fallbackResponse(text, payload) {
+  const fallbackFromPayload = buildFallbackFromPayload(payload);
+  if (fallbackFromPayload) {
+    if (text && !/Summary unavailable/i.test(text)) {
+      fallbackFromPayload.disclaimer =
+        fallbackFromPayload.disclaimer + " (AI service note: " + text + ")";
+    }
+    return fallbackFromPayload;
+  }
+  return {
+    recap: text.slice(0, 400) || "Summary unavailable.",
+    patterns: [],
+    suggestions: [
+      "Consider tracking when symptoms start and any possible triggers.",
+      "If anything feels urgent or severe, seek medical care."
+    ],
+    redFlags: [],
+    questionsForClinician: ["What additional details would be helpful to record?"],
+    disclaimer:
+      "This app provides informational pattern-based insights only and does not provide medical diagnosis. If you think this may be an emergency, call your local emergency number."
+  };
+}
+
+function normalizeAIResponse(raw, payload) {
+  if (
+    raw &&
+    typeof raw === "object" &&
+    typeof raw.recap === "string" &&
+    Array.isArray(raw.patterns) &&
+    Array.isArray(raw.suggestions) &&
+    Array.isArray(raw.redFlags) &&
+    Array.isArray(raw.questionsForClinician) &&
+    typeof raw.disclaimer === "string"
+  ) {
+    const cleaned = {
+      recap: raw.recap,
+      patterns: sanitizeList(raw.patterns),
+      suggestions: sanitizeList(raw.suggestions),
+      redFlags: Array.isArray(raw.redFlags) ? raw.redFlags : [],
+      questionsForClinician: sanitizeList(raw.questionsForClinician),
+      disclaimer: raw.disclaimer
+    };
+    return ensureRelevant(cleaned, payload);
+  }
+
+  const summary = raw?.summary || {};
+  const recapParts = [];
+  if (Array.isArray(summary.notedSymptoms)) recapParts.push(...summary.notedSymptoms);
+  if (Array.isArray(summary.generalObservations)) recapParts.push(...summary.generalObservations.slice(0, 1));
+  const recap = recapParts.join(" ").trim() || "Summary unavailable.";
+
+  const patterns = sanitizeList([
+    ...(Array.isArray(summary.identifiedPatterns) ? summary.identifiedPatterns : []),
+    ...(Array.isArray(summary.potentialCorrelations) ? summary.potentialCorrelations : [])
+  ]);
+
+  const suggestions = sanitizeList([
+    ...(Array.isArray(summary.generalObservations) ? summary.generalObservations : []),
+    ...(Array.isArray(raw?.warnings) ? raw.warnings : [])
+  ]);
+  if (suggestions.length === 0) {
+    suggestions.push(
+      "Consider tracking when symptoms start and any possible triggers.",
+      "If anything feels urgent or severe, seek medical care."
+    );
+  }
+
+  const disclaimer = [raw?.disclaimer, raw?.emergencyGuidance]
+    .filter(Boolean)
+    .join(" ")
+    .trim() ||
+    "This app provides informational pattern-based insights only and does not provide medical diagnosis. If you think this may be an emergency, call your local emergency number.";
+
+  return ensureRelevant({
+    recap,
+    patterns,
+    suggestions,
+    redFlags: [],
+    questionsForClinician: sanitizeList([
+      "What additional details should I track?",
+      "Are there any warning signs I should watch for?"
+    ]),
+    disclaimer
+  }, payload);
+}
+
+function ensureRelevant(response, payload) {
+  const fallback = buildFallbackFromPayload(payload);
+  if (!fallback) return response;
+
+  const symptomNames = Array.from(
+    new Set((payload?.entries || []).map((entry) => entry.symptomType).filter(Boolean))
+  );
+  const question = payload?.userQuestion ? String(payload.userQuestion).trim() : "";
+  const recap = response?.recap || "";
+  const recapLower = recap.toLowerCase();
+  const mentionsSymptom =
+    symptomNames.length === 0 ||
+    symptomNames.some((name) => recapLower.includes(String(name).toLowerCase()));
+  const mentionsQuestion = question.length === 0 ? true : containsQuestionKeyword(recapLower, question);
+  const isSummaryUnavailable = /summary unavailable|summary not available|unable to summarize/i.test(recapLower);
+
+  if (!mentionsSymptom || !mentionsQuestion || recap.trim().length < 8 || isSummaryUnavailable) {
+    response.recap = fallback.recap;
+  }
+  if (!Array.isArray(response.suggestions) || response.suggestions.length === 0) {
+    response.suggestions = fallback.suggestions;
+  }
+  if (!Array.isArray(response.questionsForClinician) || response.questionsForClinician.length === 0) {
+    response.questionsForClinician = fallback.questionsForClinician;
+  }
+  if (!response.disclaimer || response.disclaimer.length < 20) {
+    response.disclaimer = fallback.disclaimer;
+  }
+  if (response.disclaimer && !/emergency number/i.test(response.disclaimer)) {
+    response.disclaimer = response.disclaimer.trim() + " If you think this may be an emergency, call your local emergency number.";
+  }
+  if (!Array.isArray(response.redFlags)) {
+    response.redFlags = [];
+  }
+  if (!Array.isArray(response.patterns) || response.patterns.length === 0) {
+    response.patterns = fallback.patterns ?? [];
+  } else {
+    response.patterns = sanitizeList(response.patterns);
+  }
+  response.questionsForClinician = sanitizeList(response.questionsForClinician);
+  response.suggestions = sanitizeList(response.suggestions);
+  return response;
+}
+
+function containsQuestionKeyword(recapLower, question) {
+  const cleaned = question.toLowerCase().replace(/[^a-z0-9\\s]/g, " ");
+  const keywords = cleaned.split(/\\s+/).filter((word) => word.length >= 4);
+  if (keywords.length === 0) {
+    return recapLower.includes(cleaned.trim());
+  }
+  return keywords.some((word) => recapLower.includes(word));
+}
+
+function sanitizeList(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0)
+    .slice(0, 8);
+}
+
+function buildFallbackFromPayload(payload) {
+  if (!payload || !Array.isArray(payload.entries)) return null;
+  const entries = payload.entries;
+  const timeframe = payload.timeframe;
+  const uniqueSymptoms = Array.from(
+    new Set(entries.map((entry) => entry.symptomType).filter(Boolean))
+  );
+  const triggers = Array.from(
+    new Set(entries.flatMap((entry) => entry.triggers || []).filter(Boolean))
+  );
+  const recapParts = [];
+  if (payload?.userQuestion) {
+    const cleaned = String(payload.userQuestion).split("\n")[0].slice(0, 140);
+    recapParts.push(`You asked: ${cleaned}.`);
+  }
+  if (uniqueSymptoms.length > 0) {
+    recapParts.push(`You logged: ${uniqueSymptoms.join(", ")}.`);
+  }
+  if (entries.length > 0) {
+    const severities = entries.map((entry) => entry.severity).filter((value) => typeof value === "number");
+    if (severities.length > 0) {
+      const avg = severities.reduce((sum, value) => sum + value, 0) / severities.length;
+      recapParts.push(`Average severity: ${avg.toFixed(1)}/10.`);
+    }
+  }
+  if (timeframe?.start && timeframe?.end) {
+    recapParts.push(`Timeframe: ${timeframe.start} to ${timeframe.end}.`);
+  }
+  if (recapParts.length === 0) {
+    recapParts.push(`You asked: ${payload.userQuestion || "Analyze my logs."}`);
+  }
+
+  const patterns = [];
+  if (uniqueSymptoms.length > 0) {
+    patterns.push(`Symptoms logged: ${uniqueSymptoms.join(", ")}.`);
+  }
+  if (triggers.length > 0) {
+    patterns.push(`Possible triggers noted: ${triggers.join(", ")}.`);
+  }
+
+  const suggestions = [
+    "Continue logging when symptoms start, how long they last, and any possible triggers.",
+    "If symptoms feel severe or rapidly worsening, consider urgent medical care."
+  ];
+
+  return {
+    recap: recapParts.join(" "),
+    patterns,
+    suggestions,
+    redFlags: [],
+    questionsForClinician: [
+      "What additional details should I track about these symptoms?",
+      "Are there warning signs specific to this symptom I should watch for?"
+    ],
+    disclaimer:
+      "This app provides informational pattern-based insights only and does not provide medical diagnosis. If you think this may be an emergency, call your local emergency number."
+  };
+}
+
+app.post("/ai/analyze", async (req, res) => {
+  let payload;
+  try {
+    payload = buildUserPayload(req.body.request);
+    let result;
+    if (AI_PROVIDER === "gemini") {
+      const contents = [
+        {
+          role: "user",
+          parts: [
+            {
+              text:
+                "User question: " +
+                (payload.userQuestion || "Analyze my logs") +
+                "\n\nPayload:\n" +
+                JSON.stringify(payload)
+            }
+          ]
+        }
+      ];
+      result = await callGemini(contents, payload);
+    } else {
+      const input = [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: JSON.stringify(payload) }
+      ];
+      result = normalizeAIResponse(await callOpenAI(input), payload);
+    }
+    logAIRequest({ provider: AI_PROVIDER, endpoint: "/ai/analyze", payload, response: result, success: true });
+    res.json(result);
+  } catch (error) {
+    logAIRequest({
+      provider: AI_PROVIDER,
+      endpoint: "/ai/analyze",
+      payload,
+      response: null,
+      success: false,
+      error: error.message || "Server error"
+    });
+    res.status(500).json({ error: error.message || "Server error" });
+  }
+});
+
+app.post("/ai/chat", async (req, res) => {
+  let payload;
+  try {
+    payload = buildUserPayload(req.body.request);
+    const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
+    const trimmedMessages = messages.slice(-6);
+    let result;
+    if (AI_PROVIDER === "gemini") {
+      const contents = [
+        ...trimmedMessages.map((message) => ({
+          role: message.role === "assistant" ? "model" : "user",
+          parts: [{ text: message.content }]
+        })),
+        {
+          role: "user",
+          parts: [
+            {
+              text:
+                "User question: " +
+                (payload.userQuestion || "Analyze my logs") +
+                "\n\nPayload:\n" +
+                JSON.stringify(payload)
+            }
+          ]
+        }
+      ];
+      result = await callGemini(contents, payload);
+    } else {
+      const input = [
+        { role: "system", content: systemPrompt },
+        ...trimmedMessages.map((message) => ({
+          role: message.role === "assistant" ? "assistant" : "user",
+          content: message.content
+        })),
+        { role: "user", content: JSON.stringify(payload) }
+      ];
+      result = normalizeAIResponse(await callOpenAI(input), payload);
+    }
+    logAIRequest({ provider: AI_PROVIDER, endpoint: "/ai/chat", payload, response: result, success: true });
+    res.json(result);
+  } catch (error) {
+    logAIRequest({
+      provider: AI_PROVIDER,
+      endpoint: "/ai/chat",
+      payload,
+      response: null,
+      success: false,
+      error: error.message || "Server error"
+    });
+    res.status(500).json({ error: error.message || "Server error" });
+  }
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`Symptom Nerd backend listening on http://localhost:${PORT}`);
+  console.log(`AI provider: ${AI_PROVIDER}`);
+});

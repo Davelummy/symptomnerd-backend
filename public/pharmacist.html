@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Symptom Nerd | Pharmacist Console</title>
+  <link rel="stylesheet" href="/pharmacist/pharmacist.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>Pharmacist Console</h1>
+        <p class="subtitle">Triage chats and call requests.</p>
+      </div>
+      <div class="meta">
+        <span id="lastRefresh">Last refresh: --</span>
+        <button id="refreshBtn">Refresh</button>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="panel" aria-label="Chat sessions">
+        <div class="panel-header">
+          <h2>Chat sessions</h2>
+          <input id="sessionSearch" type="search" placeholder="Search by name or message" />
+        </div>
+        <ul id="sessionsList" class="list"></ul>
+      </section>
+
+      <section class="panel chat" aria-label="Chat details">
+        <div class="panel-header">
+          <div>
+            <h2 id="sessionTitle">Select a chat</h2>
+            <p id="sessionSubtitle" class="subtitle">Messages will appear here.</p>
+          </div>
+          <div class="status-controls">
+            <input id="statusText" type="text" placeholder="Status text" />
+            <input id="queuePosition" type="number" min="0" placeholder="Queue" />
+            <button id="saveStatus">Update</button>
+          </div>
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <form id="messageForm" class="message-form">
+          <textarea id="messageInput" rows="3" placeholder="Write a response..."></textarea>
+          <button type="submit">Send</button>
+        </form>
+      </section>
+
+      <section class="panel" aria-label="Call requests">
+        <div class="panel-header">
+          <h2>Call requests</h2>
+          <select id="callStatusFilter">
+            <option value="all">All</option>
+            <option value="requested">Requested</option>
+            <option value="in_progress">In progress</option>
+            <option value="completed">Completed</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+        </div>
+        <ul id="callsList" class="list"></ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="/pharmacist/pharmacist.js"></script>
+</body>
+</html>
