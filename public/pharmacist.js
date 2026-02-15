@@ -43,6 +43,7 @@ const baseDocumentTitle = document.title;
 let device = null;
 let activeVoiceCall = null;
 let incomingVoiceCall = null;
+const callMeta = new WeakMap();
 
 const COMPLETED_CALL_STATUSES = new Set(["completed"]);
 const MISSED_CALL_STATUSES = new Set(["failed", "cancelled", "missed", "no_answer", "busy", "rejected"]);
@@ -85,6 +86,24 @@ const userNameForCall = (call) =>
 const short = (value, max = 80) => {
   if (!value) return "";
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+};
+
+const requestIdFromCall = (call) => {
+  const custom = call?.customParameters;
+  const requestId = custom?.get ? custom.get("requestId") : null;
+  return requestId || null;
+};
+
+const updateCallStatusQuietly = async (callId, status) => {
+  if (!callId) return;
+  try {
+    await api(`/calls/${callId}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status })
+    });
+  } catch (error) {
+    console.warn(`Failed to update call ${callId} to ${status}:`, error?.message || error);
+  }
 };
 
 const getInitials = (value) =>
@@ -237,8 +256,24 @@ const callerLabelFromCall = (call) => {
   return callerName || callerIdentity || call.parameters?.From || "Unknown caller";
 };
 
-const wireCallLifecycle = (call) => {
+const wireCallLifecycle = (call, options = {}) => {
+  const meta = {
+    requestId: options.requestId || requestIdFromCall(call),
+    wasConnected: false
+  };
+  callMeta.set(call, meta);
+
+  call.on("ringing", () => {
+    const current = callMeta.get(call) || meta;
+    if (current.requestId) {
+      void updateCallStatusQuietly(current.requestId, "ringing");
+    }
+  });
+
   call.on("accept", () => {
+    const current = callMeta.get(call) || meta;
+    current.wasConnected = true;
+    callMeta.set(call, current);
     activeVoiceCall = call;
     incomingVoiceCall = null;
     state.isOnHold = false;
@@ -260,9 +295,13 @@ const wireCallLifecycle = (call) => {
       canMute: true,
       canHold: true
     });
+    if (current.requestId) {
+      void updateCallStatusQuietly(current.requestId, "in_progress");
+    }
   });
 
   call.on("disconnect", () => {
+    const current = callMeta.get(call) || meta;
     activeVoiceCall = null;
     incomingVoiceCall = null;
     stopLiveTimer();
@@ -279,10 +318,14 @@ const wireCallLifecycle = (call) => {
       canMute: false,
       canHold: false
     });
+    if (current.requestId) {
+      void updateCallStatusQuietly(current.requestId, current.wasConnected ? "completed" : "missed");
+    }
     refreshIncomingBadge();
   });
 
   call.on("cancel", () => {
+    const current = callMeta.get(call) || meta;
     incomingVoiceCall = null;
     stopLiveTimer();
     stopTitlePulse();
@@ -298,17 +341,25 @@ const wireCallLifecycle = (call) => {
       canMute: false,
       canHold: false
     });
+    if (current.requestId) {
+      void updateCallStatusQuietly(current.requestId, "missed");
+    }
     refreshIncomingBadge();
   });
 
   call.on("reject", () => {
+    const current = callMeta.get(call) || meta;
     incomingVoiceCall = null;
     stopLiveTimer();
     stopTitlePulse();
     setVoiceBadge("Voice online", "");
+    if (current.requestId) {
+      void updateCallStatusQuietly(current.requestId, "missed");
+    }
   });
 
   call.on("error", (error) => {
+    const current = callMeta.get(call) || meta;
     console.error("Twilio call error:", error);
     stopLiveTimer();
     setVoiceBadge("Voice error", "danger");
@@ -323,7 +374,70 @@ const wireCallLifecycle = (call) => {
       canMute: false,
       canHold: false
     });
+    if (current.requestId) {
+      void updateCallStatusQuietly(current.requestId, "failed");
+    }
   });
+};
+
+const startCallbackCall = async (call) => {
+  if (!device) {
+    alert("Voice line is not ready yet.");
+    return;
+  }
+  if (activeVoiceCall || incomingVoiceCall) {
+    alert("Finish the current call first.");
+    return;
+  }
+  const identity = String(call.identity || "").trim();
+  if (!identity) {
+    alert("Callback is unavailable for this call (missing caller identity).");
+    return;
+  }
+
+  const caller = userNameForCall(call);
+  setVoiceBadge("Calling back", "incoming");
+  setLiveCallUI({
+    title: "Calling back",
+    meta: `Dialing ${caller}…`,
+    caller,
+    open: true,
+    ringing: false,
+    canAnswer: false,
+    canReject: false,
+    canHangup: true,
+    canMute: false,
+    canHold: false
+  });
+
+  try {
+    const callbackCall = await device.connect({
+      params: {
+        To: identity,
+        RequestID: call.id,
+        CallerName: "Pharmacist"
+      }
+    });
+    activeVoiceCall = callbackCall;
+    wireCallLifecycle(callbackCall, { requestId: call.id });
+    await updateCallStatusQuietly(call.id, "ringing");
+  } catch (error) {
+    console.error("Callback attempt failed:", error);
+    setVoiceBadge("Callback failed", "danger");
+    setLiveCallUI({
+      title: "Callback failed",
+      meta: error?.message || "Could not place callback.",
+      caller,
+      open: false,
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: false,
+      canMute: false,
+      canHold: false
+    });
+    await updateCallStatusQuietly(call.id, "failed");
+  }
 };
 
 const refreshTwilioToken = async () => {
@@ -372,7 +486,11 @@ const setupVoiceDevice = async () => {
 
     device.on("incoming", (call) => {
       incomingVoiceCall = call;
-      wireCallLifecycle(call);
+      const requestId = requestIdFromCall(call);
+      wireCallLifecycle(call, { requestId });
+      if (requestId) {
+        void updateCallStatusQuietly(requestId, "ringing");
+      }
       const caller = callerLabelFromCall(call);
       setVoiceBadge("Incoming live call", "incoming");
       setLiveCallUI({
@@ -524,11 +642,18 @@ const renderCalls = () => {
     const caller = userNameForCall(call);
     const outcome = getCallOutcomeLabel(call);
     const completedAt = formatTime(call.endedAt || call.updatedAt || call.createdAt);
+    const hasCallback = outcome === "Missed" && Boolean(call.identity);
     li.innerHTML = `
       <div class="title">${caller}<span class="pill ${outcome === "Completed" ? "returning" : "requested"}">${outcome}</span></div>
       <div class="meta">${short(call.handoff?.userMessage || "Call request")}</div>
       <div class="meta">${outcome} • ${completedAt}</div>
+      ${hasCallback ? '<button class="history-cta" data-action="callback">Call back</button>' : ""}
     `;
+    if (hasCallback) {
+      li.querySelector('[data-action="callback"]')?.addEventListener("click", () => {
+        void startCallbackCall(call);
+      });
+    }
     callsList.appendChild(li);
   });
 };
@@ -624,6 +749,7 @@ answerCallBtn.addEventListener("click", async () => {
 
 endCallBtn.addEventListener("click", () => {
   if (incomingVoiceCall) {
+    const requestId = requestIdFromCall(incomingVoiceCall);
     incomingVoiceCall.reject();
     incomingVoiceCall = null;
     setVoiceBadge("Voice online", "");
@@ -636,6 +762,9 @@ endCallBtn.addEventListener("click", () => {
       canReject: false,
       canHangup: false
     });
+    if (requestId) {
+      void updateCallStatusQuietly(requestId, "missed");
+    }
     refreshIncomingBadge();
     return;
   }

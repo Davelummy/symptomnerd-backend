@@ -238,8 +238,8 @@ function extractBearerToken(req) {
 
 const CALLS_COLLECTION = "pharmacist_call_requests";
 const ACTIVE_CALL_STATUSES = ["requested", "queued", "ringing", "in_progress"];
-const TERMINAL_CALL_STATUSES = new Set(["completed", "failed", "cancelled"]);
-const USER_UPDATABLE_CALL_STATUSES = new Set(["ringing", "in_progress", "completed", "failed", "cancelled"]);
+const TERMINAL_CALL_STATUSES = new Set(["completed", "failed", "cancelled", "missed"]);
+const USER_UPDATABLE_CALL_STATUSES = new Set(["ringing", "in_progress", "completed", "failed", "cancelled", "missed"]);
 
 function parseCallerNameParts(fullName) {
   const pieces = String(fullName || "")

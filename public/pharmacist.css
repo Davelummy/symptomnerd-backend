@@ -154,6 +154,17 @@ textarea {
   font-size: 12px;
 }
 
+.history-cta {
+  margin-top: 10px;
+  width: 100%;
+  border-radius: 10px;
+  background: #234f78;
+}
+
+.history-cta:hover {
+  background: #2b6799;
+}
+
 .list-item.incoming {
   border-color: #f6c955;
   box-shadow: 0 0 0 1px rgba(246, 201, 85, 0.35);
