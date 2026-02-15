@@ -236,6 +236,151 @@ function extractBearerToken(req) {
   return header.slice("Bearer ".length).trim();
 }
 
+const CALLS_COLLECTION = "pharmacist_call_requests";
+const ACTIVE_CALL_STATUSES = ["requested", "queued", "ringing", "in_progress"];
+const TERMINAL_CALL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const USER_UPDATABLE_CALL_STATUSES = new Set(["ringing", "in_progress", "completed", "failed", "cancelled"]);
+
+function parseCallerNameParts(fullName) {
+  const pieces = String(fullName || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!pieces.length) {
+    return { firstName: "User", lastName: "" };
+  }
+  return {
+    firstName: pieces[0],
+    lastName: pieces.slice(1).join(" ")
+  };
+}
+
+function resolveCallerName(decoded) {
+  const fromToken = [decoded?.given_name, decoded?.family_name].filter(Boolean).join(" ").trim();
+  if (fromToken) return fromToken.slice(0, 80);
+  const display = String(decoded?.name || "").trim();
+  if (display) return display.slice(0, 80);
+  const email = String(decoded?.email || "").trim();
+  if (email.includes("@")) return email.split("@")[0].slice(0, 80);
+  return `User ${String(decoded?.uid || "unknown").slice(0, 6)}`;
+}
+
+async function verifyFirebaseUserFromRequest(req) {
+  const idToken = extractBearerToken(req);
+  if (!idToken) {
+    const error = new Error("Missing Firebase ID token.");
+    error.statusCode = 401;
+    throw error;
+  }
+  const decoded = await admin.auth().verifyIdToken(idToken);
+  const uid = decoded.uid;
+  const identity = sanitizeIdentity(`user_${uid}`, `user_${Date.now()}`);
+  const callerName = resolveCallerName(decoded);
+  const { firstName, lastName } = parseCallerNameParts(callerName);
+  return {
+    decoded,
+    uid,
+    identity,
+    callerName,
+    firstName,
+    lastName,
+    userEmail: decoded.email || ""
+  };
+}
+
+function callCreatedAtMillis(doc) {
+  const createdAt = doc.data()?.createdAt;
+  if (createdAt && typeof createdAt.toMillis === "function") {
+    return createdAt.toMillis();
+  }
+  return 0;
+}
+
+async function listActiveCalls() {
+  const snapshot = await firestore
+    .collection(CALLS_COLLECTION)
+    .where("status", "in", ACTIVE_CALL_STATUSES)
+    .get();
+  return snapshot.docs.sort((left, right) => callCreatedAtMillis(left) - callCreatedAtMillis(right));
+}
+
+async function rebalanceCallQueue() {
+  const docs = await listActiveCalls();
+  if (!docs.length) return;
+
+  const batch = firestore.batch();
+  let hasUpdates = false;
+
+  docs.forEach((doc, index) => {
+    const data = doc.data() || {};
+    const queuePosition = index + 1;
+    const updates = {};
+
+    if (data.queuePosition !== queuePosition) {
+      updates.queuePosition = queuePosition;
+    }
+
+    if (queuePosition === 1 && data.status === "queued") {
+      updates.status = "requested";
+    }
+
+    if (Object.keys(updates).length) {
+      updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+      batch.update(doc.ref, updates);
+      hasUpdates = true;
+    }
+  });
+
+  if (hasUpdates) {
+    await batch.commit();
+  }
+}
+
+async function deleteCollectionDocs(collectionRef) {
+  const snapshot = await collectionRef.get();
+  if (snapshot.empty) return 0;
+  const batch = firestore.batch();
+  snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+  await batch.commit();
+  return snapshot.size;
+}
+
+async function resetPharmacistData() {
+  const sessionsSnapshot = await firestore.collection("pharmacist_sessions").get();
+  let deletedMessages = 0;
+  const sessionBatch = firestore.batch();
+
+  for (const sessionDoc of sessionsSnapshot.docs) {
+    deletedMessages += await deleteCollectionDocs(sessionDoc.ref.collection("messages"));
+    sessionBatch.delete(sessionDoc.ref);
+  }
+
+  if (!sessionsSnapshot.empty) {
+    await sessionBatch.commit();
+  }
+
+  const callsSnapshot = await firestore.collection(CALLS_COLLECTION).get();
+  const callsBatch = firestore.batch();
+  callsSnapshot.docs.forEach((doc) => callsBatch.delete(doc.ref));
+  if (!callsSnapshot.empty) {
+    await callsBatch.commit();
+  }
+
+  if (LOG_AI_REQUESTS) {
+    const sqlPool = getPool();
+    if (sqlPool) {
+      await ensureDb();
+      await sqlPool.query("TRUNCATE TABLE ai_requests;");
+    }
+  }
+
+  return {
+    deletedSessions: sessionsSnapshot.size,
+    deletedMessages,
+    deletedCalls: callsSnapshot.size
+  };
+}
+
 app.use("/pharmacist", requirePharmacistAuth, express.static(publicDir));
 app.get("/pharmacist", requirePharmacistAuth, (req, res) => {
   res.sendFile(path.join(publicDir, "pharmacist.html"));
@@ -320,7 +465,7 @@ app.post("/pharmacist/api/sessions/:id/status", async (req, res) => {
 app.get("/pharmacist/api/calls", async (req, res) => {
   try {
     const snapshot = await firestore
-      .collection("pharmacist_call_requests")
+      .collection(CALLS_COLLECTION)
       .orderBy("createdAt", "desc")
       .limit(100)
       .get();
@@ -335,13 +480,31 @@ app.post("/pharmacist/api/calls/:id/status", async (req, res) => {
   try {
     const { id } = req.params;
     const status = req.body?.status || "in_progress";
-    await firestore.collection("pharmacist_call_requests").doc(id).update({
+    const update = {
       status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    };
+    if (status === "in_progress") {
+      update.startedAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+    if (TERMINAL_CALL_STATUSES.has(status)) {
+      update.endedAt = admin.firestore.FieldValue.serverTimestamp();
+      update.queuePosition = null;
+    }
+    await firestore.collection(CALLS_COLLECTION).doc(id).update(update);
+    await rebalanceCallQueue();
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update call status." });
+  }
+});
+
+app.post("/pharmacist/api/admin/reset", async (_req, res) => {
+  try {
+    const result = await resetPharmacistData();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to reset pharmacist data." });
   }
 });
 
@@ -363,26 +526,139 @@ app.post("/twilio/access-token", ensureFirebase, async (req, res) => {
     if (!isTwilioConfigured()) {
       return res.status(500).json({ error: "Twilio Voice not configured." });
     }
-
-    const idToken = extractBearerToken(req);
-    if (!idToken) {
-      return res.status(401).json({ error: "Missing Firebase ID token." });
-    }
-
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    const uid = decoded.uid;
-    const identity = sanitizeIdentity(`user_${uid}`, `user_${Date.now()}`);
-    const displayName = (decoded.name || decoded.email || `User ${uid.slice(0, 6)}`).toString().slice(0, 80);
-    const token = createTwilioVoiceToken(identity);
-
+    const user = await verifyFirebaseUserFromRequest(req);
+    const token = createTwilioVoiceToken(user.identity);
     return res.json({
       token,
-      identity,
-      displayName,
+      identity: user.identity,
+      displayName: user.callerName,
       pharmacistIdentity: sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console")
     });
   } catch (err) {
-    return res.status(401).json({ error: err?.message || "Invalid Firebase ID token." });
+    const statusCode = err?.statusCode || 401;
+    return res.status(statusCode).json({ error: err?.message || "Invalid Firebase ID token." });
+  }
+});
+
+app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
+  try {
+    const user = await verifyFirebaseUserFromRequest(req);
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    await rebalanceCallQueue();
+    let activeCalls = await listActiveCalls();
+    let existingCall = activeCalls.find((doc) => doc.data()?.userId === user.uid);
+    let queuePosition = 1;
+    let callRef;
+
+    if (existingCall) {
+      callRef = existingCall.ref;
+      queuePosition =
+        existingCall.data()?.queuePosition ||
+        Math.max(
+          1,
+          activeCalls.findIndex((doc) => doc.id === existingCall.id) + 1
+        );
+    } else {
+      callRef = firestore.collection(CALLS_COLLECTION).doc();
+      const handoff = req.body?.handoff || {};
+      queuePosition = activeCalls.length + 1;
+      const initialStatus = queuePosition <= 1 ? "requested" : "queued";
+      await callRef.set({
+        id: callRef.id,
+        userId: user.uid,
+        callerName: user.callerName,
+        callerFirstName: user.firstName,
+        callerLastName: user.lastName,
+        userDisplayName: user.callerName,
+        userEmail: user.userEmail,
+        identity: user.identity,
+        handoff: {
+          userMessage: String(handoff.userMessage || "").slice(0, 500),
+          summarizedLogs: String(handoff.summarizedLogs || "").slice(0, 4000),
+          attachedRange: handoff.attachedRange || null
+        },
+        status: initialStatus,
+        queuePosition,
+        createdAt: now,
+        updatedAt: now
+      });
+      await rebalanceCallQueue();
+      const refreshed = await callRef.get();
+      queuePosition = refreshed.data()?.queuePosition || queuePosition;
+    }
+
+    if (queuePosition > 1) {
+      return res.json({
+        queued: true,
+        requestId: callRef.id,
+        queuePosition,
+        message: `All pharmacists are on active calls. You are #${queuePosition} in queue.`
+      });
+    }
+
+    if (!isTwilioConfigured()) {
+      return res.status(503).json({
+        error: "Twilio Voice not configured.",
+        requestId: callRef.id
+      });
+    }
+
+    const token = createTwilioVoiceToken(user.identity);
+    return res.json({
+      queued: false,
+      requestId: callRef.id,
+      queuePosition: 1,
+      token,
+      identity: user.identity,
+      displayName: user.callerName,
+      pharmacistIdentity: sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console")
+    });
+  } catch (err) {
+    const statusCode = err?.statusCode || 500;
+    return res.status(statusCode).json({ error: err?.message || "Unable to start call." });
+  }
+});
+
+app.post("/twilio/calls/:id/status", ensureFirebase, async (req, res) => {
+  try {
+    const user = await verifyFirebaseUserFromRequest(req);
+    const { id } = req.params;
+    const status = String(req.body?.status || "").trim();
+    if (!USER_UPDATABLE_CALL_STATUSES.has(status)) {
+      return res.status(400).json({ error: "Invalid call status." });
+    }
+
+    const callRef = firestore.collection(CALLS_COLLECTION).doc(id);
+    const snapshot = await callRef.get();
+    if (!snapshot.exists) {
+      return res.status(404).json({ error: "Call request not found." });
+    }
+
+    const current = snapshot.data() || {};
+    if (current.userId !== user.uid) {
+      return res.status(403).json({ error: "You cannot update this call request." });
+    }
+
+    const update = {
+      status,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (status === "in_progress") {
+      update.startedAt = current.startedAt || admin.firestore.FieldValue.serverTimestamp();
+      update.queuePosition = 1;
+    }
+    if (TERMINAL_CALL_STATUSES.has(status)) {
+      update.endedAt = admin.firestore.FieldValue.serverTimestamp();
+      update.queuePosition = null;
+    }
+
+    await callRef.update(update);
+    await rebalanceCallQueue();
+    return res.json({ ok: true });
+  } catch (err) {
+    const statusCode = err?.statusCode || 500;
+    return res.status(statusCode).json({ error: err?.message || "Unable to update call status." });
   }
 });
 
@@ -393,6 +669,9 @@ app.post("/twilio/voice", express.urlencoded({ extended: false }), (req, res) =>
 
   const requestedTo = sanitizeIdentity(req.body?.To || req.query?.to, "");
   const callerIdentity = sanitizeIdentity(req.body?.From || req.body?.Caller || "", "");
+  const requestId = String(req.body?.RequestID || req.body?.requestId || "")
+    .trim()
+    .slice(0, 120);
   const callerName = String(req.body?.CallerName || req.body?.callerName || "")
     .trim()
     .slice(0, 80);
@@ -410,6 +689,9 @@ app.post("/twilio/voice", express.urlencoded({ extended: false }), (req, res) =>
   }
   if (callerIdentity) {
     client.parameter({ name: "callerIdentity", value: callerIdentity });
+  }
+  if (requestId) {
+    client.parameter({ name: "requestId", value: requestId });
   }
 
   return res.type("text/xml").send(twiml.toString());

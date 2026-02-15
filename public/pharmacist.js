@@ -4,7 +4,10 @@ const state = {
   activeSessionId: null,
   userSessionCounts: {},
   requestedCallIds: new Set(),
-  callsHydrated: false
+  callsHydrated: false,
+  liveCallStartedAt: null,
+  isMuted: false,
+  isOnHold: false
 };
 
 const sessionsList = document.getElementById("sessionsList");
@@ -18,6 +21,7 @@ const statusTextInput = document.getElementById("statusText");
 const queuePositionInput = document.getElementById("queuePosition");
 const saveStatusBtn = document.getElementById("saveStatus");
 const refreshBtn = document.getElementById("refreshBtn");
+const resetDataBtn = document.getElementById("resetDataBtn");
 const lastRefresh = document.getElementById("lastRefresh");
 const sessionSearch = document.getElementById("sessionSearch");
 const callStatusFilter = document.getElementById("callStatusFilter");
@@ -26,12 +30,16 @@ const voiceStatusBadge = document.getElementById("voiceStatusBadge");
 const liveCallCard = document.getElementById("liveCallCard");
 const liveCallTitle = document.getElementById("liveCallTitle");
 const liveCallMeta = document.getElementById("liveCallMeta");
+const liveCallTimer = document.getElementById("liveCallTimer");
 const answerCallBtn = document.getElementById("answerCallBtn");
 const rejectCallBtn = document.getElementById("rejectCallBtn");
 const hangupCallBtn = document.getElementById("hangupCallBtn");
+const muteCallBtn = document.getElementById("muteCallBtn");
+const holdCallBtn = document.getElementById("holdCallBtn");
 
 let audioContext;
 let titlePulseInterval;
+let liveTimerInterval;
 const baseDocumentTitle = document.title;
 let device = null;
 let activeVoiceCall = null;
@@ -139,13 +147,59 @@ const setVoiceBadge = (text, mode) => {
   }
 };
 
-const setLiveCallUI = ({ title, meta, ringing = false, canAnswer = false, canReject = false, canHangup = false }) => {
+const formatDuration = (seconds) => {
+  const total = Math.max(0, seconds);
+  const minutes = Math.floor(total / 60);
+  const remainder = total % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+};
+
+const stopLiveTimer = () => {
+  if (liveTimerInterval) {
+    clearInterval(liveTimerInterval);
+    liveTimerInterval = null;
+  }
+};
+
+const startLiveTimer = () => {
+  stopLiveTimer();
+  state.liveCallStartedAt = Date.now();
+  liveCallTimer.textContent = "00:00";
+  liveTimerInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - state.liveCallStartedAt) / 1000);
+    liveCallTimer.textContent = formatDuration(elapsed);
+  }, 1000);
+};
+
+const setLiveCallUI = ({
+  title,
+  meta,
+  ringing = false,
+  canAnswer = false,
+  canReject = false,
+  canHangup = false,
+  canMute = false,
+  canHold = false
+}) => {
   liveCallTitle.textContent = title;
   liveCallMeta.textContent = meta;
   liveCallCard.classList.toggle("ringing", ringing);
   answerCallBtn.disabled = !canAnswer;
   rejectCallBtn.disabled = !canReject;
   hangupCallBtn.disabled = !canHangup;
+  muteCallBtn.disabled = !canMute;
+  holdCallBtn.disabled = !canHold;
+  if (!canHangup) {
+    stopLiveTimer();
+    liveCallTimer.textContent = "00:00";
+    state.liveCallStartedAt = null;
+    state.isMuted = false;
+    state.isOnHold = false;
+    muteCallBtn.textContent = "Mute";
+    holdCallBtn.textContent = "Hold";
+  }
+  muteCallBtn.classList.toggle("active", state.isMuted);
+  holdCallBtn.classList.toggle("active", state.isOnHold);
 };
 
 const callerLabelFromCall = (call) => {
@@ -159,6 +213,11 @@ const wireCallLifecycle = (call) => {
   call.on("accept", () => {
     activeVoiceCall = call;
     incomingVoiceCall = null;
+    state.isOnHold = false;
+    state.isMuted = false;
+    muteCallBtn.textContent = "Mute";
+    holdCallBtn.textContent = "Hold";
+    startLiveTimer();
     setVoiceBadge("Live connected", "incoming");
     setLiveCallUI({
       title: "Live call connected",
@@ -166,13 +225,16 @@ const wireCallLifecycle = (call) => {
       ringing: false,
       canAnswer: false,
       canReject: false,
-      canHangup: true
+      canHangup: true,
+      canMute: true,
+      canHold: true
     });
   });
 
   call.on("disconnect", () => {
     activeVoiceCall = null;
     incomingVoiceCall = null;
+    stopLiveTimer();
     setVoiceBadge("Voice online", "");
     setLiveCallUI({
       title: "No active live call",
@@ -180,13 +242,16 @@ const wireCallLifecycle = (call) => {
       ringing: false,
       canAnswer: false,
       canReject: false,
-      canHangup: false
+      canHangup: false,
+      canMute: false,
+      canHold: false
     });
     refreshIncomingBadge();
   });
 
   call.on("cancel", () => {
     incomingVoiceCall = null;
+    stopLiveTimer();
     setVoiceBadge("Voice online", "");
     setLiveCallUI({
       title: "Missed incoming call",
@@ -194,18 +259,22 @@ const wireCallLifecycle = (call) => {
       ringing: false,
       canAnswer: false,
       canReject: false,
-      canHangup: false
+      canHangup: false,
+      canMute: false,
+      canHold: false
     });
     refreshIncomingBadge();
   });
 
   call.on("reject", () => {
     incomingVoiceCall = null;
+    stopLiveTimer();
     setVoiceBadge("Voice online", "");
   });
 
   call.on("error", (error) => {
     console.error("Twilio call error:", error);
+    stopLiveTimer();
     setVoiceBadge("Voice error", "danger");
     setLiveCallUI({
       title: "Voice call error",
@@ -213,7 +282,9 @@ const wireCallLifecycle = (call) => {
       ringing: false,
       canAnswer: false,
       canReject: false,
-      canHangup: false
+      canHangup: false,
+      canMute: false,
+      canHold: false
     });
   });
 };
@@ -308,7 +379,7 @@ const setupVoiceDevice = async () => {
 };
 
 const refreshIncomingBadge = () => {
-  const requestedCount = state.calls.filter((call) => call.status === "requested").length;
+  const requestedCount = state.calls.filter((call) => ["requested", "queued", "ringing"].includes(call.status)).length;
   const hasVoiceIncoming = Boolean(incomingVoiceCall);
   const totalIncoming = requestedCount + (hasVoiceIncoming ? 1 : 0);
   if (!totalIncoming) {
@@ -385,17 +456,26 @@ const renderMessages = (messages) => {
 
 const renderCalls = () => {
   const filter = callStatusFilter.value;
-  const filtered = state.calls.filter((call) => (filter === "all" ? true : call.status === filter));
+  const filtered = state.calls
+    .filter((call) => (filter === "all" ? true : call.status === filter))
+    .sort((left, right) => {
+      const leftQueue = Number.isFinite(left.queuePosition) ? left.queuePosition : Number.MAX_SAFE_INTEGER;
+      const rightQueue = Number.isFinite(right.queuePosition) ? right.queuePosition : Number.MAX_SAFE_INTEGER;
+      if (leftQueue !== rightQueue) return leftQueue - rightQueue;
+      return new Date(right.createdAt || 0).getTime() - new Date(left.createdAt || 0).getTime();
+    });
   callsList.innerHTML = "";
   filtered.forEach((call) => {
     const li = document.createElement("li");
-    li.className = `list-item ${call.status === "requested" ? "incoming" : ""}`;
+    li.className = `list-item ${["requested", "queued", "ringing"].includes(call.status) ? "incoming" : ""}`;
     const caller = userNameForCall(call);
+    const queueLabel = call.queuePosition ? ` • Queue #${call.queuePosition}` : "";
     li.innerHTML = `
-      <div class="title">${caller}${call.status === "requested" ? '<span class="pill requested">Incoming</span>' : ""}</div>
+      <div class="title">${caller}${["requested", "queued", "ringing"].includes(call.status) ? '<span class="pill requested">Incoming</span>' : ""}</div>
       <div class="meta">${short(call.handoff?.userMessage || "Call request")}</div>
-      <div class="meta">Status: ${call.status || "requested"} • ${formatTime(call.createdAt)}</div>
+      <div class="meta">Status: ${call.status || "requested"}${queueLabel} • ${formatTime(call.createdAt)}</div>
       <div class="call-actions">
+        <button data-action="ringing">Ringing</button>
         <button data-action="in_progress">In progress</button>
         <button data-action="completed">Completed</button>
         <button data-action="cancelled">Cancelled</button>
@@ -433,7 +513,7 @@ const loadCalls = async () => {
   state.calls = data.calls || [];
 
   const currentRequested = new Set(
-    state.calls.filter((call) => call.status === "requested").map((call) => call.id)
+    state.calls.filter((call) => ["requested", "queued", "ringing"].includes(call.status)).map((call) => call.id)
   );
 
   if (state.callsHydrated) {
@@ -518,6 +598,43 @@ rejectCallBtn.addEventListener("click", () => {
 hangupCallBtn.addEventListener("click", () => {
   if (!activeVoiceCall) return;
   activeVoiceCall.disconnect();
+});
+
+muteCallBtn.addEventListener("click", () => {
+  if (!activeVoiceCall) return;
+  state.isMuted = !state.isMuted;
+  activeVoiceCall.mute(state.isMuted);
+  muteCallBtn.classList.toggle("active", state.isMuted);
+  muteCallBtn.textContent = state.isMuted ? "Unmute" : "Mute";
+});
+
+holdCallBtn.addEventListener("click", () => {
+  if (!activeVoiceCall) return;
+  state.isOnHold = !state.isOnHold;
+  activeVoiceCall.mute(state.isOnHold);
+  holdCallBtn.classList.toggle("active", state.isOnHold);
+  holdCallBtn.textContent = state.isOnHold ? "Resume" : "Hold";
+});
+
+resetDataBtn.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "This deletes all chat sessions, messages, and call history for every user. Continue?"
+  );
+  if (!confirmed) return;
+  resetDataBtn.disabled = true;
+  try {
+    await api("/admin/reset", { method: "POST", body: "{}" });
+    state.activeSessionId = null;
+    sessionTitle.textContent = "Select a chat";
+    sessionSubtitle.textContent = "Messages will appear here.";
+    messagesEl.innerHTML = "";
+    await refreshAll();
+    alert("All pharmacist data has been cleared.");
+  } catch (error) {
+    alert(error?.message || "Failed to clear data.");
+  } finally {
+    resetDataBtn.disabled = false;
+  }
 });
 
 refreshBtn.addEventListener("click", refreshAll);

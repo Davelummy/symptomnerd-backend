@@ -18,6 +18,7 @@
         <span id="incomingBadge" class="badge">No incoming calls</span>
         <span id="lastRefresh">Last refresh: --</span>
         <button id="refreshBtn">Refresh</button>
+        <button id="resetDataBtn" class="danger">Clear all data</button>
       </div>
     </header>
 
@@ -57,6 +58,8 @@
           <select id="callStatusFilter">
             <option value="all">All</option>
             <option value="requested">Requested</option>
+            <option value="queued">Queued</option>
+            <option value="ringing">Ringing</option>
             <option value="in_progress">In progress</option>
             <option value="completed">Completed</option>
             <option value="cancelled">Cancelled</option>
@@ -65,10 +68,13 @@
         <div id="liveCallCard" class="live-call">
           <div id="liveCallTitle" class="title">Live call line is starting…</div>
           <div id="liveCallMeta" class="meta">The pharmacist browser line must stay open to receive calls.</div>
+          <div id="liveCallTimer" class="timer">00:00</div>
           <div class="call-actions">
             <button id="answerCallBtn" disabled>Answer</button>
             <button id="rejectCallBtn" disabled>Decline</button>
             <button id="hangupCallBtn" disabled>Hang up</button>
+            <button id="muteCallBtn" disabled>Mute</button>
+            <button id="holdCallBtn" disabled>Hold</button>
           </div>
         </div>
         <ul id="callsList" class="list"></ul>
