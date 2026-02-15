@@ -217,20 +217,6 @@ function isFirestoreQuotaExceeded(err) {
   );
 }
 
-function buildDirectTwilioCallPayload(user, message = null) {
-  return {
-    queued: false,
-    requestId: null,
-    queuePosition: 1,
-    token: createTwilioVoiceToken(user.identity),
-    identity: user.identity,
-    displayName: user.callerName,
-    pharmacistIdentity: sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console"),
-    degraded: true,
-    message: message || "Connected directly because queue service is temporarily unavailable."
-  };
-}
-
 function isTwilioConfigured() {
   return Boolean(TWILIO_ACCOUNT_SID && TWILIO_API_KEY && TWILIO_API_SECRET && TWILIO_TWIML_APP_SID);
 }
@@ -627,7 +613,6 @@ app.post("/twilio/access-token", ensureFirebase, async (req, res) => {
 app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
   try {
     const user = await verifyFirebaseUserFromRequest(req);
-    const now = admin.firestore.FieldValue.serverTimestamp();
 
     if (!isTwilioConfigured()) {
       return res.status(503).json({
@@ -635,25 +620,11 @@ app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
       });
     }
 
-    await rebalanceCallQueue();
-    let activeCalls = await listActiveCalls();
-    let existingCall = activeCalls.find((doc) => doc.data()?.userId === user.uid);
-    let queuePosition = 1;
-    let callRef;
-
-    if (existingCall) {
-      callRef = existingCall.ref;
-      queuePosition =
-        existingCall.data()?.queuePosition ||
-        Math.max(
-          1,
-          activeCalls.findIndex((doc) => doc.id === existingCall.id) + 1
-        );
-    } else {
-      callRef = firestore.collection(CALLS_COLLECTION).doc();
-      const handoff = req.body?.handoff || {};
-      queuePosition = activeCalls.length + 1;
-      const initialStatus = queuePosition <= 1 ? "requested" : "queued";
+    let requestId = null;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const handoff = req.body?.handoff || {};
+    try {
+      const callRef = firestore.collection(CALLS_COLLECTION).doc();
       await callRef.set({
         id: callRef.id,
         userId: user.uid,
@@ -668,29 +639,20 @@ app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
           summarizedLogs: String(handoff.summarizedLogs || "").slice(0, 4000),
           attachedRange: handoff.attachedRange || null
         },
-        status: initialStatus,
-        queuePosition,
+        status: "requested",
+        queuePosition: 1,
         createdAt: now,
         updatedAt: now
       });
-      await rebalanceCallQueue();
-      const refreshed = await callRef.get();
-      queuePosition = refreshed.data()?.queuePosition || queuePosition;
-    }
-
-    if (queuePosition > 1) {
-      return res.json({
-        queued: true,
-        requestId: callRef.id,
-        queuePosition,
-        message: `All pharmacists are on active calls. You are #${queuePosition} in queue.`
-      });
+      requestId = callRef.id;
+    } catch (writeErr) {
+      console.warn("Call logging unavailable, continuing with direct live call:", writeErr?.message || writeErr);
     }
 
     const token = createTwilioVoiceToken(user.identity);
     return res.json({
       queued: false,
-      requestId: callRef.id,
+      requestId,
       queuePosition: 1,
       token,
       identity: user.identity,
@@ -698,25 +660,6 @@ app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
       pharmacistIdentity: sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console")
     });
   } catch (err) {
-    if (isFirestoreQuotaExceeded(err)) {
-      try {
-        const user = await verifyFirebaseUserFromRequest(req);
-        if (isTwilioConfigured()) {
-          return res.json(
-            buildDirectTwilioCallPayload(
-              user,
-              "Queue service is temporarily unavailable. We are connecting you directly."
-            )
-          );
-        }
-      } catch {
-        // Fall through to standard error response.
-      }
-      return res.status(429).json({
-        error:
-          "Live call queue is unavailable because Firestore quota is exceeded. Direct Twilio connection is also unavailable."
-      });
-    }
     const statusCode = err?.statusCode || 500;
     return res.status(statusCode).json({ error: err?.message || "Unable to start call." });
   }

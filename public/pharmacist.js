@@ -3,6 +3,8 @@ const state = {
   calls: [],
   activeSessionId: null,
   userSessionCounts: {},
+  sessionUpdatedAt: {},
+  sessionsHydrated: false,
   requestedCallIds: new Set(),
   callsHydrated: false,
   liveCallStartedAt: null,
@@ -46,6 +48,7 @@ let device = null;
 let activeVoiceCall = null;
 let incomingVoiceCall = null;
 const callMeta = new WeakMap();
+let latestActiveSessionMessageId = null;
 
 const COMPLETED_CALL_STATUSES = new Set(["completed"]);
 const MISSED_CALL_STATUSES = new Set(["failed", "cancelled", "missed", "no_answer", "busy", "rejected"]);
@@ -66,6 +69,20 @@ const api = async (path, options = {}) => {
     throw new Error(payload.error || "Request failed");
   }
   return response.json();
+};
+
+const notifyBrowser = async (title, body) => {
+  if (!("Notification" in window)) return;
+  try {
+    if (Notification.permission === "default") {
+      await Notification.requestPermission();
+    }
+    if (Notification.permission === "granted") {
+      new Notification(title, { body });
+    }
+  } catch {
+    // Best effort only.
+  }
 };
 
 const formatTime = (value) => {
@@ -385,66 +402,6 @@ const wireCallLifecycle = (call, options = {}) => {
   });
 };
 
-const startCallbackCall = async (call) => {
-  if (!device) {
-    alert("Voice line is not ready yet.");
-    return;
-  }
-  if (activeVoiceCall || incomingVoiceCall) {
-    alert("Finish the current call first.");
-    return;
-  }
-  const identity = String(call.identity || "").trim();
-  if (!identity) {
-    alert("Callback is unavailable for this call (missing caller identity).");
-    return;
-  }
-
-  const caller = userNameForCall(call);
-  setVoiceBadge("Calling back", "incoming");
-  setLiveCallUI({
-    title: "Calling back",
-    meta: `Dialing ${caller}…`,
-    caller,
-    open: true,
-    ringing: false,
-    canAnswer: false,
-    canReject: false,
-    canHangup: true,
-    canMute: false,
-    canHold: false
-  });
-
-  try {
-    const callbackCall = await device.connect({
-      params: {
-        To: identity,
-        RequestID: call.id,
-        CallerName: "Pharmacist"
-      }
-    });
-    activeVoiceCall = callbackCall;
-    wireCallLifecycle(callbackCall, { requestId: call.id });
-    await updateCallStatusQuietly(call.id, "ringing");
-  } catch (error) {
-    console.error("Callback attempt failed:", error);
-    setVoiceBadge("Callback failed", "danger");
-    setLiveCallUI({
-      title: "Callback failed",
-      meta: error?.message || "Could not place callback.",
-      caller,
-      open: false,
-      ringing: false,
-      canAnswer: false,
-      canReject: false,
-      canHangup: false,
-      canMute: false,
-      canHold: false
-    });
-    await updateCallStatusQuietly(call.id, "failed");
-  }
-};
-
 const refreshTwilioToken = async () => {
   if (!device) return;
   const payload = await api("/twilio/token", { method: "POST", body: "{}" });
@@ -647,26 +604,39 @@ const renderCalls = () => {
     const caller = userNameForCall(call);
     const outcome = getCallOutcomeLabel(call);
     const completedAt = formatTime(call.endedAt || call.updatedAt || call.createdAt);
-    const hasCallback = outcome === "Missed" && Boolean(call.identity);
     li.innerHTML = `
       <div class="title">${caller}<span class="pill ${outcome === "Completed" ? "returning" : "requested"}">${outcome}</span></div>
       <div class="meta">${short(call.handoff?.userMessage || "Call request")}</div>
       <div class="meta">${outcome} • ${completedAt}</div>
-      ${hasCallback ? '<button class="history-cta" data-action="callback">Call back</button>' : ""}
+      <div class="meta">User must initiate next call from app.</div>
     `;
-    if (hasCallback) {
-      li.querySelector('[data-action="callback"]')?.addEventListener("click", () => {
-        void startCallbackCall(call);
-      });
-    }
     callsList.appendChild(li);
   });
 };
 
 const loadSessions = async () => {
+  const previousUpdatedAt = { ...state.sessionUpdatedAt };
+  const previousIds = new Set(state.sessions.map((session) => session.id));
   const data = await api("/sessions");
   state.sessions = data.sessions || [];
   state.userSessionCounts = buildUserSessionCounts(state.sessions);
+  state.sessionUpdatedAt = Object.fromEntries(
+    state.sessions.map((session) => [session.id, String(session.updatedAt || session.createdAt || "")])
+  );
+
+  if (state.sessionsHydrated) {
+    for (const session of state.sessions) {
+      const isNew = !previousIds.has(session.id);
+      const wasUpdated =
+        previousUpdatedAt[session.id] &&
+        previousUpdatedAt[session.id] !== state.sessionUpdatedAt[session.id];
+      if ((isNew || wasUpdated) && session.id !== state.activeSessionId) {
+        void notifyBrowser("New pharmacist chat activity", userNameForSession(session));
+      }
+    }
+  }
+  state.sessionsHydrated = true;
+
   if (state.activeSessionId) {
     const exists = state.sessions.some((session) => session.id === state.activeSessionId);
     if (!exists) {
@@ -681,7 +651,15 @@ const loadSessions = async () => {
 
 const loadMessages = async (sessionId) => {
   const data = await api(`/sessions/${sessionId}/messages`);
-  renderMessages(data.messages || []);
+  const messages = data.messages || [];
+  renderMessages(messages);
+  const latest = [...messages].reverse().find((message) => message.role === "user");
+  if (latest && latest.id !== latestActiveSessionMessageId) {
+    if (latestActiveSessionMessageId) {
+      void notifyBrowser("New user message", short(latest.content || "", 90));
+    }
+    latestActiveSessionMessageId = latest.id;
+  }
 };
 
 const loadCalls = async () => {
