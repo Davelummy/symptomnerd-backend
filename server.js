@@ -139,7 +139,7 @@ const geminiResponseSchema = {
   required: ["recap", "patterns", "suggestions", "redFlags", "questionsForClinician", "disclaimer"]
 };
 
-const systemPrompt = `You are Symptom Nerd AI. Provide informational, pattern-based insights only.\n- Do not diagnose, prescribe, or claim certainty.\n- Do not provide medication dosing or specific treatment instructions.\n- If no logs are provided, focus on the user's question only.\n- Recap MUST explicitly mention the user's question and any logged symptom types.\n- Start recap with: "You asked about ..." or "You asked: ..."\n- Use the user's exact symptom words when possible.\n- Include emergency guidance when relevant: "If you think this may be an emergency, call your local emergency number."\n- Output must strictly match the JSON schema.\n- Keep tone calm and non-alarming.`;
+const systemPrompt = `You are Symptom Nerd AI, a structured symptom-pattern assistant.\n- You are informational only: do not diagnose, prescribe, or claim certainty.\n- Always analyze all shared logs jointly across the timeframe before answering.\n- Use medicalContext (allergies, chronic conditions, medications, surgeries, family history, notes, recent health history) as key context for interpretation.\n- Weigh current symptom logs with medical profile/history together, and call out when historical context may influence possible explanations or risk.\n- Acknowledge the user's concern directly and reference symptom trends, severity, triggers, and timing from logs.\n- Suggest a wide range of plausible, non-diagnostic possibilities and practical next-step options.\n- If medication names are present, include interaction-safety cautions and recommend pharmacist review for interaction checks.\n- Ask targeted follow-up questions in "questionsForClinician" whenever uncertainty remains.\n- If risk is elevated, uncertainty remains high, or symptoms persist/worsen, explicitly recommend pharmacist chat/call.\n- Include emergency guidance when relevant: "If you think this may be an emergency, call your local emergency number."\n- Respect preferred language if provided in payload.\n- Output must strictly match the JSON schema.\n- Keep tone calm, clear, and non-alarming.`;
 
 function getPool() {
   if (!LOG_AI_REQUESTS || !NEON_DATABASE_URL) return null;
@@ -237,6 +237,7 @@ function extractBearerToken(req) {
 }
 
 const CALLS_COLLECTION = "pharmacist_call_requests";
+const PRESENCE_COLLECTION = "pharmacist_presence";
 const ACTIVE_CALL_STATUSES = ["requested", "queued", "ringing", "in_progress"];
 const TERMINAL_CALL_STATUSES = new Set(["completed", "failed", "cancelled", "missed"]);
 const USER_UPDATABLE_CALL_STATUSES = new Set(["ringing", "in_progress", "completed", "failed", "cancelled", "missed"]);
@@ -366,6 +367,13 @@ async function resetPharmacistData() {
     await callsBatch.commit();
   }
 
+  const presenceSnapshot = await firestore.collection(PRESENCE_COLLECTION).get();
+  const presenceBatch = firestore.batch();
+  presenceSnapshot.docs.forEach((doc) => presenceBatch.delete(doc.ref));
+  if (!presenceSnapshot.empty) {
+    await presenceBatch.commit();
+  }
+
   if (LOG_AI_REQUESTS) {
     const sqlPool = getPool();
     if (sqlPool) {
@@ -377,7 +385,8 @@ async function resetPharmacistData() {
   return {
     deletedSessions: sessionsSnapshot.size,
     deletedMessages,
-    deletedCalls: callsSnapshot.size
+    deletedCalls: callsSnapshot.size,
+    deletedPresenceDocs: presenceSnapshot.size
   };
 }
 
@@ -505,6 +514,22 @@ app.post("/pharmacist/api/admin/reset", async (_req, res) => {
     res.json({ ok: true, ...result });
   } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to reset pharmacist data." });
+  }
+});
+
+app.post("/pharmacist/api/presence/heartbeat", async (_req, res) => {
+  try {
+    await firestore.collection(PRESENCE_COLLECTION).doc("console").set(
+      {
+        id: "console",
+        isOnline: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to update presence." });
   }
 });
 
@@ -662,6 +687,25 @@ app.post("/twilio/calls/:id/status", ensureFirebase, async (req, res) => {
   }
 });
 
+app.get("/twilio/calls/:id", ensureFirebase, async (req, res) => {
+  try {
+    const user = await verifyFirebaseUserFromRequest(req);
+    const { id } = req.params;
+    const snapshot = await firestore.collection(CALLS_COLLECTION).doc(id).get();
+    if (!snapshot.exists) {
+      return res.status(404).json({ error: "Call request not found." });
+    }
+    const data = snapshot.data() || {};
+    if (data.userId !== user.uid) {
+      return res.status(403).json({ error: "You cannot access this call request." });
+    }
+    return res.json({ call: serializeDoc(snapshot) });
+  } catch (err) {
+    const statusCode = err?.statusCode || 500;
+    return res.status(statusCode).json({ error: err?.message || "Unable to load call request." });
+  }
+});
+
 app.post("/twilio/voice", express.urlencoded({ extended: false }), (req, res) => {
   if (!isTwilioConfigured()) {
     return res.status(500).type("text/plain").send("Twilio Voice is not configured.");
@@ -695,6 +739,31 @@ app.post("/twilio/voice", express.urlencoded({ extended: false }), (req, res) =>
   }
 
   return res.type("text/xml").send(twiml.toString());
+});
+
+app.get("/pharmacist-presence", ensureFirebase, async (_req, res) => {
+  try {
+    const presenceDoc = await firestore.collection(PRESENCE_COLLECTION).doc("console").get();
+    const presenceData = presenceDoc.data() || {};
+    const updatedAtMillis =
+      typeof presenceData.updatedAt?.toMillis === "function" ? presenceData.updatedAt.toMillis() : 0;
+    const online = updatedAtMillis > 0 && Date.now() - updatedAtMillis < 45_000;
+
+    const activeCallsSnapshot = await firestore
+      .collection(CALLS_COLLECTION)
+      .where("status", "in", ACTIVE_CALL_STATUSES)
+      .get();
+    const activeCalls = activeCallsSnapshot.size;
+    const estimatedWaitMinutes = Math.max(0, (activeCalls - 1) * 6);
+
+    return res.json({
+      online,
+      activeCalls,
+      estimatedWaitMinutes
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || "Failed to fetch presence." });
+  }
 });
 
 async function ensureDb() {
@@ -746,7 +815,7 @@ async function logAIRequest({ provider, endpoint, payload, response, success, er
 }
 
 function buildUserPayload(request) {
-  const { entries, timeframe, userPrefs, locale, timezone, userQuestion } = request || {};
+  const { entries, timeframe, userPrefs, locale, timezone, userQuestion, preferredLanguage, medicalContext } = request || {};
 
   const sanitizedEntries = Array.isArray(entries)
     ? entries.map((entry) => ({
@@ -757,6 +826,7 @@ function buildUserPayload(request) {
         durationMinutes: entry.durationMinutes ?? null,
         triggers: entry.triggers ?? [],
         notes: entry.notes ?? null,
+        medsTaken: Array.isArray(entry.medsTaken) ? entry.medsTaken : [],
         sleepHours: userPrefs?.dataMinimizationOn ? null : entry.sleepHours ?? null,
         hydrationLiters: userPrefs?.dataMinimizationOn ? null : entry.hydrationLiters ?? null,
         caffeineMg: userPrefs?.dataMinimizationOn ? null : entry.caffeineMg ?? null,
@@ -769,7 +839,9 @@ function buildUserPayload(request) {
     timeframe,
     locale,
     timezone,
+    preferredLanguage: preferredLanguage || "English",
     userPrefs,
+    medicalContext: medicalContext || null,
     entries: sanitizedEntries
   };
 }
@@ -1044,6 +1116,7 @@ function buildFallbackFromPayload(payload) {
   if (!payload || !Array.isArray(payload.entries)) return null;
   const entries = payload.entries;
   const timeframe = payload.timeframe;
+  const medicalContext = payload.medicalContext || null;
   const uniqueSymptoms = Array.from(
     new Set(entries.map((entry) => entry.symptomType).filter(Boolean))
   );
@@ -1068,6 +1141,19 @@ function buildFallbackFromPayload(payload) {
   if (timeframe?.start && timeframe?.end) {
     recapParts.push(`Timeframe: ${timeframe.start} to ${timeframe.end}.`);
   }
+  if (medicalContext) {
+    const contextualSignals = [
+      medicalContext.chronicConditions,
+      medicalContext.currentMedications,
+      medicalContext.allergies
+    ]
+      .filter(Boolean)
+      .map((value) => String(value).trim())
+      .filter((value) => value.length > 0);
+    if (contextualSignals.length > 0) {
+      recapParts.push("I also considered your medical profile context while interpreting these logs.");
+    }
+  }
   if (recapParts.length === 0) {
     recapParts.push(`You asked: ${payload.userQuestion || "Analyze my logs."}`);
   }
@@ -1079,11 +1165,17 @@ function buildFallbackFromPayload(payload) {
   if (triggers.length > 0) {
     patterns.push(`Possible triggers noted: ${triggers.join(", ")}.`);
   }
+  if (medicalContext?.recentHealthHistory?.length) {
+    patterns.push(`Recent health history entries were considered (${medicalContext.recentHealthHistory.length} records).`);
+  }
 
   const suggestions = [
     "Continue logging when symptoms start, how long they last, and any possible triggers.",
     "If symptoms feel severe or rapidly worsening, consider urgent medical care."
   ];
+  if (medicalContext?.currentMedications) {
+    suggestions.push("Because medications are listed in your profile, ask a pharmacist to review for possible interaction or side-effect overlap.");
+  }
 
   return {
     recap: recapParts.join(" "),
