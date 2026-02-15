@@ -32,8 +32,7 @@ const liveCallTitle = document.getElementById("liveCallTitle");
 const liveCallMeta = document.getElementById("liveCallMeta");
 const liveCallTimer = document.getElementById("liveCallTimer");
 const answerCallBtn = document.getElementById("answerCallBtn");
-const rejectCallBtn = document.getElementById("rejectCallBtn");
-const hangupCallBtn = document.getElementById("hangupCallBtn");
+const endCallBtn = document.getElementById("endCallBtn");
 const muteCallBtn = document.getElementById("muteCallBtn");
 const holdCallBtn = document.getElementById("holdCallBtn");
 
@@ -212,12 +211,13 @@ const setLiveCallUI = ({
   liveCallAvatar.textContent = getInitials(caller);
   liveCallCard.classList.toggle("open", open);
   liveCallCard.classList.toggle("ringing", ringing);
+  const canEndCall = canReject || canHangup;
   answerCallBtn.disabled = !canAnswer;
-  rejectCallBtn.disabled = !canReject;
-  hangupCallBtn.disabled = !canHangup;
+  endCallBtn.disabled = !canEndCall;
   muteCallBtn.disabled = !canMute;
   holdCallBtn.disabled = !canHold;
-  if (!canHangup) {
+  endCallBtn.textContent = "End call";
+  if (!canEndCall) {
     stopLiveTimer();
     liveCallTimer.textContent = "00:00";
     state.liveCallStartedAt = null;
@@ -622,26 +622,27 @@ answerCallBtn.addEventListener("click", async () => {
   }
 });
 
-rejectCallBtn.addEventListener("click", () => {
-  if (!incomingVoiceCall) return;
-  incomingVoiceCall.reject();
-  incomingVoiceCall = null;
-  setVoiceBadge("Voice online", "");
-  setLiveCallUI({
-    title: "Call declined",
-    meta: "Waiting for incoming pharmacist calls from users.",
-    open: false,
-    ringing: false,
-    canAnswer: false,
-    canReject: false,
-    canHangup: false
-  });
-  refreshIncomingBadge();
-});
+endCallBtn.addEventListener("click", () => {
+  if (incomingVoiceCall) {
+    incomingVoiceCall.reject();
+    incomingVoiceCall = null;
+    setVoiceBadge("Voice online", "");
+    setLiveCallUI({
+      title: "Call ended",
+      meta: "Waiting for incoming pharmacist calls from users.",
+      open: false,
+      ringing: false,
+      canAnswer: false,
+      canReject: false,
+      canHangup: false
+    });
+    refreshIncomingBadge();
+    return;
+  }
 
-hangupCallBtn.addEventListener("click", () => {
-  if (!activeVoiceCall) return;
-  activeVoiceCall.disconnect();
+  if (activeVoiceCall) {
+    activeVoiceCall.disconnect();
+  }
 });
 
 muteCallBtn.addEventListener("click", () => {
