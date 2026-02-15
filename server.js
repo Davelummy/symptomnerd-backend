@@ -206,6 +206,16 @@ function serializeDoc(doc) {
   return { id: doc.id, ...serializeValue(data) };
 }
 
+function isFirestoreQuotaExceeded(err) {
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    err?.code === 8 ||
+    err?.code === "resource-exhausted" ||
+    message.includes("resource_exhausted") ||
+    message.includes("quota exceeded")
+  );
+}
+
 function isTwilioConfigured() {
   return Boolean(TWILIO_ACCOUNT_SID && TWILIO_API_KEY && TWILIO_API_SECRET && TWILIO_TWIML_APP_SID);
 }
@@ -399,17 +409,20 @@ app.use("/pharmacist/api", requirePharmacistAuth, ensureFirebase);
 
 app.get("/pharmacist/api/sessions", async (req, res) => {
   try {
-    const snapshot = await firestore.collection("pharmacist_sessions").get();
-    const sessions = snapshot.docs
-      .map(serializeDoc)
-      .sort((left, right) => {
-        const leftTime = new Date(left.updatedAt || left.createdAt || 0).getTime();
-        const rightTime = new Date(right.updatedAt || right.createdAt || 0).getTime();
-        return rightTime - leftTime;
-      })
-      .slice(0, 100);
+    const snapshot = await firestore
+      .collection("pharmacist_sessions")
+      .orderBy("updatedAt", "desc")
+      .limit(50)
+      .get();
+    const sessions = snapshot.docs.map(serializeDoc);
     res.json({ sessions });
   } catch (err) {
+    if (isFirestoreQuotaExceeded(err)) {
+      return res.status(429).json({
+        error:
+          "Firestore quota exceeded. Open Firebase Billing to upgrade, or wait for quota reset (daily reset around midnight Pacific)."
+      });
+    }
     res.status(500).json({ error: err?.message || "Failed to load sessions." });
   }
 });
@@ -476,17 +489,20 @@ app.post("/pharmacist/api/sessions/:id/status", async (req, res) => {
 
 app.get("/pharmacist/api/calls", async (req, res) => {
   try {
-    const snapshot = await firestore.collection(CALLS_COLLECTION).get();
-    const calls = snapshot.docs
-      .map(serializeDoc)
-      .sort((left, right) => {
-        const leftTime = new Date(left.createdAt || left.updatedAt || 0).getTime();
-        const rightTime = new Date(right.createdAt || right.updatedAt || 0).getTime();
-        return rightTime - leftTime;
-      })
-      .slice(0, 100);
+    const snapshot = await firestore
+      .collection(CALLS_COLLECTION)
+      .orderBy("createdAt", "desc")
+      .limit(50)
+      .get();
+    const calls = snapshot.docs.map(serializeDoc);
     res.json({ calls });
   } catch (err) {
+    if (isFirestoreQuotaExceeded(err)) {
+      return res.status(429).json({
+        error:
+          "Firestore quota exceeded. Open Firebase Billing to upgrade, or wait for quota reset (daily reset around midnight Pacific)."
+      });
+    }
     res.status(500).json({ error: err?.message || "Failed to load calls." });
   }
 });
@@ -664,6 +680,12 @@ app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
       pharmacistIdentity: sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console")
     });
   } catch (err) {
+    if (isFirestoreQuotaExceeded(err)) {
+      return res.status(429).json({
+        error:
+          "Live call is temporarily unavailable because Firestore quota is exceeded. Upgrade Firebase billing or wait for quota reset."
+      });
+    }
     const statusCode = err?.statusCode || 500;
     return res.status(statusCode).json({ error: err?.message || "Unable to start call." });
   }

@@ -39,6 +39,7 @@ const holdCallBtn = document.getElementById("holdCallBtn");
 let audioContext;
 let titlePulseInterval;
 let liveTimerInterval;
+let refreshIntervalHandle;
 const baseDocumentTitle = document.title;
 let device = null;
 let activeVoiceCall = null;
@@ -729,6 +730,15 @@ const refreshAll = async () => {
   }
 };
 
+const startAutoRefresh = () => {
+  if (refreshIntervalHandle) {
+    clearInterval(refreshIntervalHandle);
+    refreshIntervalHandle = null;
+  }
+  if (document.visibilityState !== "visible") return;
+  refreshIntervalHandle = setInterval(refreshAll, 20000);
+};
+
 const sendPresenceHeartbeat = async () => {
   try {
     await api("/presence/heartbeat", { method: "POST", body: "{}" });
@@ -858,4 +868,5 @@ api("/diagnostics")
   .catch((error) => {
     console.warn("Diagnostics unavailable:", error?.message || error);
   });
-setInterval(refreshAll, 5000);
+document.addEventListener("visibilitychange", startAutoRefresh);
+startAutoRefresh();
