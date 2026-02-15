@@ -5,6 +5,8 @@ const state = {
   userSessionCounts: {},
   requestedCallIds: new Set(),
   callsHydrated: false,
+  sessionsHydrated: false,
+  sessionUpdatedAt: new Map(),
   liveCallStartedAt: null,
   isMuted: false,
   isOnHold: false
@@ -44,6 +46,27 @@ let device = null;
 let activeVoiceCall = null;
 let incomingVoiceCall = null;
 const callMeta = new WeakMap();
+
+const requestBrowserNotifications = async () => {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    try {
+      await Notification.requestPermission();
+    } catch {
+      // Best effort only.
+    }
+  }
+};
+
+const notifyAdmin = (title, body) => {
+  if (!("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+  try {
+    new Notification(title, { body });
+  } catch {
+    // Best effort only.
+  }
+};
 
 const COMPLETED_CALL_STATUSES = new Set(["completed"]);
 const MISSED_CALL_STATUSES = new Set(["failed", "cancelled", "missed", "no_answer", "busy", "rejected"]);
@@ -505,6 +528,7 @@ const setupVoiceDevice = async () => {
       });
       ringIncoming();
       startTitlePulse();
+      notifyAdmin("Incoming pharmacist call", `${caller} is calling now.`);
     });
 
     device.on("error", (error) => {
@@ -660,7 +684,23 @@ const renderCalls = () => {
 
 const loadSessions = async () => {
   const data = await api("/sessions");
-  state.sessions = data.sessions || [];
+  const nextSessions = data.sessions || [];
+  const shouldNotify = [];
+  const nextUpdatedMap = new Map();
+  nextSessions.forEach((session) => {
+    const updatedAtMs = new Date(session.updatedAt || session.createdAt || 0).getTime();
+    nextUpdatedMap.set(session.id, updatedAtMs);
+    if (!state.sessionsHydrated) return;
+    const previousMs = state.sessionUpdatedAt.get(session.id) || 0;
+    const isNewOrUpdated = !state.sessionUpdatedAt.has(session.id) || updatedAtMs > previousMs + 500;
+    if (isNewOrUpdated && session.id !== state.activeSessionId) {
+      shouldNotify.push(session);
+    }
+  });
+
+  state.sessionUpdatedAt = nextUpdatedMap;
+  state.sessionsHydrated = true;
+  state.sessions = nextSessions;
   state.userSessionCounts = buildUserSessionCounts(state.sessions);
   if (state.activeSessionId) {
     const exists = state.sessions.some((session) => session.id === state.activeSessionId);
@@ -669,6 +709,11 @@ const loadSessions = async () => {
     }
   }
   renderSessions();
+
+  if (document.visibilityState !== "visible" && shouldNotify.length > 0) {
+    const latest = shouldNotify[0];
+    notifyAdmin("New pharmacist message", `${userNameForSession(latest)} sent a message.`);
+  }
 };
 
 const loadMessages = async (sessionId) => {
@@ -826,5 +871,6 @@ setLiveCallUI({
 });
 
 setupVoiceDevice();
+requestBrowserNotifications();
 refreshAll();
 setInterval(refreshAll, 5000);
