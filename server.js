@@ -399,12 +399,15 @@ app.use("/pharmacist/api", requirePharmacistAuth, ensureFirebase);
 
 app.get("/pharmacist/api/sessions", async (req, res) => {
   try {
-    const snapshot = await firestore
-      .collection("pharmacist_sessions")
-      .orderBy("updatedAt", "desc")
-      .limit(100)
-      .get();
-    const sessions = snapshot.docs.map(serializeDoc);
+    const snapshot = await firestore.collection("pharmacist_sessions").get();
+    const sessions = snapshot.docs
+      .map(serializeDoc)
+      .sort((left, right) => {
+        const leftTime = new Date(left.updatedAt || left.createdAt || 0).getTime();
+        const rightTime = new Date(right.updatedAt || right.createdAt || 0).getTime();
+        return rightTime - leftTime;
+      })
+      .slice(0, 100);
     res.json({ sessions });
   } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to load sessions." });
@@ -473,15 +476,36 @@ app.post("/pharmacist/api/sessions/:id/status", async (req, res) => {
 
 app.get("/pharmacist/api/calls", async (req, res) => {
   try {
-    const snapshot = await firestore
-      .collection(CALLS_COLLECTION)
-      .orderBy("createdAt", "desc")
-      .limit(100)
-      .get();
-    const calls = snapshot.docs.map(serializeDoc);
+    const snapshot = await firestore.collection(CALLS_COLLECTION).get();
+    const calls = snapshot.docs
+      .map(serializeDoc)
+      .sort((left, right) => {
+        const leftTime = new Date(left.createdAt || left.updatedAt || 0).getTime();
+        const rightTime = new Date(right.createdAt || right.updatedAt || 0).getTime();
+        return rightTime - leftTime;
+      })
+      .slice(0, 100);
     res.json({ calls });
   } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to load calls." });
+  }
+});
+
+app.get("/pharmacist/api/diagnostics", async (_req, res) => {
+  try {
+    const appRef = admin.app();
+    const options = appRef.options || {};
+    const projectId = options.projectId || process.env.GCLOUD_PROJECT || null;
+    const sessionsCount = (await firestore.collection("pharmacist_sessions").limit(300).get()).size;
+    const callsCount = (await firestore.collection(CALLS_COLLECTION).limit(300).get()).size;
+    res.json({
+      ok: true,
+      projectId,
+      sessionsCount,
+      callsCount
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to load diagnostics." });
   }
 });
 
