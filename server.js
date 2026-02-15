@@ -33,6 +33,7 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_API_KEY = process.env.TWILIO_API_KEY;
 const TWILIO_API_SECRET = process.env.TWILIO_API_SECRET;
 const TWILIO_TWIML_APP_SID = process.env.TWILIO_TWIML_APP_SID;
+const TWILIO_PUSH_CREDENTIAL_SID = process.env.TWILIO_PUSH_CREDENTIAL_SID;
 const TWILIO_PHARMACIST_IDENTITY = process.env.TWILIO_PHARMACIST_IDENTITY || "pharmacist_console";
 
 const { AccessToken } = twilio.jwt;
@@ -246,10 +247,14 @@ function createTwilioVoiceToken(identity) {
   const token = new AccessToken(TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, {
     identity
   });
-  const voiceGrant = new VoiceGrant({
+  const grantPayload = {
     outgoingApplicationSid: TWILIO_TWIML_APP_SID,
     incomingAllow: true
-  });
+  };
+  if (TWILIO_PUSH_CREDENTIAL_SID) {
+    grantPayload.pushCredentialSid = TWILIO_PUSH_CREDENTIAL_SID;
+  }
+  const voiceGrant = new VoiceGrant(grantPayload);
   token.addGrant(voiceGrant);
   return token.toJwt();
 }
