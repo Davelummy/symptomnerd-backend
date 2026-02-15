@@ -40,6 +40,7 @@ let audioContext;
 let titlePulseInterval;
 let liveTimerInterval;
 let refreshIntervalHandle;
+let quotaCooldownUntil = 0;
 const baseDocumentTitle = document.title;
 let device = null;
 let activeVoiceCall = null;
@@ -59,6 +60,9 @@ const api = async (path, options = {}) => {
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
+    if (response.status === 429) {
+      quotaCooldownUntil = Date.now() + 120000;
+    }
     throw new Error(payload.error || "Request failed");
   }
   return response.json();
@@ -702,6 +706,12 @@ const loadCalls = async () => {
 };
 
 const refreshAll = async () => {
+  if (Date.now() < quotaCooldownUntil) {
+    const waitSeconds = Math.ceil((quotaCooldownUntil - Date.now()) / 1000);
+    lastRefresh.textContent = `Last refresh: cooling down after quota error (${waitSeconds}s)`;
+    return;
+  }
+
   const issues = [];
 
   await Promise.all([

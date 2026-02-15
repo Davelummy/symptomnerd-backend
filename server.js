@@ -216,6 +216,20 @@ function isFirestoreQuotaExceeded(err) {
   );
 }
 
+function buildDirectTwilioCallPayload(user, message = null) {
+  return {
+    queued: false,
+    requestId: null,
+    queuePosition: 1,
+    token: createTwilioVoiceToken(user.identity),
+    identity: user.identity,
+    displayName: user.callerName,
+    pharmacistIdentity: sanitizeIdentity(TWILIO_PHARMACIST_IDENTITY, "pharmacist_console"),
+    degraded: true,
+    message: message || "Connected directly because queue service is temporarily unavailable."
+  };
+}
+
 function isTwilioConfigured() {
   return Boolean(TWILIO_ACCOUNT_SID && TWILIO_API_KEY && TWILIO_API_SECRET && TWILIO_TWIML_APP_SID);
 }
@@ -610,6 +624,12 @@ app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
     const user = await verifyFirebaseUserFromRequest(req);
     const now = admin.firestore.FieldValue.serverTimestamp();
 
+    if (!isTwilioConfigured()) {
+      return res.status(503).json({
+        error: "Twilio Voice not configured."
+      });
+    }
+
     await rebalanceCallQueue();
     let activeCalls = await listActiveCalls();
     let existingCall = activeCalls.find((doc) => doc.data()?.userId === user.uid);
@@ -662,13 +682,6 @@ app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
       });
     }
 
-    if (!isTwilioConfigured()) {
-      return res.status(503).json({
-        error: "Twilio Voice not configured.",
-        requestId: callRef.id
-      });
-    }
-
     const token = createTwilioVoiceToken(user.identity);
     return res.json({
       queued: false,
@@ -681,9 +694,22 @@ app.post("/twilio/start-call", ensureFirebase, async (req, res) => {
     });
   } catch (err) {
     if (isFirestoreQuotaExceeded(err)) {
+      try {
+        const user = await verifyFirebaseUserFromRequest(req);
+        if (isTwilioConfigured()) {
+          return res.json(
+            buildDirectTwilioCallPayload(
+              user,
+              "Queue service is temporarily unavailable. We are connecting you directly."
+            )
+          );
+        }
+      } catch {
+        // Fall through to standard error response.
+      }
       return res.status(429).json({
         error:
-          "Live call is temporarily unavailable because Firestore quota is exceeded. Upgrade Firebase billing or wait for quota reset."
+          "Live call queue is unavailable because Firestore quota is exceeded. Direct Twilio connection is also unavailable."
       });
     }
     const statusCode = err?.statusCode || 500;
@@ -808,6 +834,14 @@ app.get("/pharmacist-presence", ensureFirebase, async (_req, res) => {
       estimatedWaitMinutes
     });
   } catch (err) {
+    if (isFirestoreQuotaExceeded(err)) {
+      return res.json({
+        online: false,
+        activeCalls: 0,
+        estimatedWaitMinutes: 0,
+        degraded: true
+      });
+    }
     return res.status(500).json({ error: err?.message || "Failed to fetch presence." });
   }
 });
