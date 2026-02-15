@@ -1199,7 +1199,9 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
-  console.log(`Symptom Nerd backend listening on http://localhost:${PORT}`);
+const HOST = process.env.HOST || "0.0.0.0";
+
+app.listen(PORT, HOST, () => {
+  console.log(`Symptom Nerd backend listening on http://${HOST}:${PORT}`);
   console.log(`AI provider: ${AI_PROVIDER}`);
 });
