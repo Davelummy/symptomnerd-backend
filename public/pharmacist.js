@@ -24,10 +24,10 @@ const refreshBtn = document.getElementById("refreshBtn");
 const resetDataBtn = document.getElementById("resetDataBtn");
 const lastRefresh = document.getElementById("lastRefresh");
 const sessionSearch = document.getElementById("sessionSearch");
-const callStatusFilter = document.getElementById("callStatusFilter");
 const incomingBadge = document.getElementById("incomingBadge");
 const voiceStatusBadge = document.getElementById("voiceStatusBadge");
 const liveCallCard = document.getElementById("liveCallCard");
+const liveCallAvatar = document.getElementById("liveCallAvatar");
 const liveCallTitle = document.getElementById("liveCallTitle");
 const liveCallMeta = document.getElementById("liveCallMeta");
 const liveCallTimer = document.getElementById("liveCallTimer");
@@ -44,6 +44,9 @@ const baseDocumentTitle = document.title;
 let device = null;
 let activeVoiceCall = null;
 let incomingVoiceCall = null;
+
+const COMPLETED_CALL_STATUSES = new Set(["completed"]);
+const MISSED_CALL_STATUSES = new Set(["failed", "cancelled", "missed", "no_answer", "busy", "rejected"]);
 
 const api = async (path, options = {}) => {
   const response = await fetch(`/pharmacist/api${path}`, {
@@ -83,6 +86,27 @@ const userNameForCall = (call) =>
 const short = (value, max = 80) => {
   if (!value) return "";
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+};
+
+const getInitials = (value) =>
+  String(value || "")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part[0] || "")
+    .join("")
+    .toUpperCase() || "SN";
+
+const isCallHistoryEntry = (call) => {
+  const status = String(call.status || "").toLowerCase();
+  return COMPLETED_CALL_STATUSES.has(status) || MISSED_CALL_STATUSES.has(status);
+};
+
+const getCallOutcomeLabel = (call) => {
+  const status = String(call.status || "").toLowerCase();
+  if (COMPLETED_CALL_STATUSES.has(status)) return "Completed";
+  if (MISSED_CALL_STATUSES.has(status)) return "Missed";
+  return "Other";
 };
 
 const buildUserSessionCounts = (sessions) => {
@@ -174,6 +198,8 @@ const startLiveTimer = () => {
 const setLiveCallUI = ({
   title,
   meta,
+  caller = "Symptom Nerd",
+  open = false,
   ringing = false,
   canAnswer = false,
   canReject = false,
@@ -183,6 +209,8 @@ const setLiveCallUI = ({
 }) => {
   liveCallTitle.textContent = title;
   liveCallMeta.textContent = meta;
+  liveCallAvatar.textContent = getInitials(caller);
+  liveCallCard.classList.toggle("open", open);
   liveCallCard.classList.toggle("ringing", ringing);
   answerCallBtn.disabled = !canAnswer;
   rejectCallBtn.disabled = !canReject;
@@ -218,10 +246,13 @@ const wireCallLifecycle = (call) => {
     muteCallBtn.textContent = "Mute";
     holdCallBtn.textContent = "Hold";
     startLiveTimer();
+    stopTitlePulse();
     setVoiceBadge("Live connected", "incoming");
     setLiveCallUI({
       title: "Live call connected",
       meta: `Talking to ${callerLabelFromCall(call)}`,
+      caller: callerLabelFromCall(call),
+      open: true,
       ringing: false,
       canAnswer: false,
       canReject: false,
@@ -235,10 +266,12 @@ const wireCallLifecycle = (call) => {
     activeVoiceCall = null;
     incomingVoiceCall = null;
     stopLiveTimer();
+    stopTitlePulse();
     setVoiceBadge("Voice online", "");
     setLiveCallUI({
       title: "No active live call",
       meta: "Waiting for incoming pharmacist calls from users.",
+      open: false,
       ringing: false,
       canAnswer: false,
       canReject: false,
@@ -252,10 +285,12 @@ const wireCallLifecycle = (call) => {
   call.on("cancel", () => {
     incomingVoiceCall = null;
     stopLiveTimer();
+    stopTitlePulse();
     setVoiceBadge("Voice online", "");
     setLiveCallUI({
       title: "Missed incoming call",
       meta: "Caller hung up before answer.",
+      open: false,
       ringing: false,
       canAnswer: false,
       canReject: false,
@@ -269,6 +304,7 @@ const wireCallLifecycle = (call) => {
   call.on("reject", () => {
     incomingVoiceCall = null;
     stopLiveTimer();
+    stopTitlePulse();
     setVoiceBadge("Voice online", "");
   });
 
@@ -279,6 +315,7 @@ const wireCallLifecycle = (call) => {
     setLiveCallUI({
       title: "Voice call error",
       meta: error?.message || "Unknown call error.",
+      open: false,
       ringing: false,
       canAnswer: false,
       canReject: false,
@@ -304,6 +341,7 @@ const setupVoiceDevice = async () => {
     setLiveCallUI({
       title: "Voice SDK missing",
       meta: "Twilio browser SDK did not load.",
+      open: false,
       ringing: false,
       canAnswer: false,
       canReject: false,
@@ -324,6 +362,7 @@ const setupVoiceDevice = async () => {
       setLiveCallUI({
         title: "No active live call",
         meta: "Waiting for incoming pharmacist calls from users.",
+        open: false,
         ringing: false,
         canAnswer: false,
         canReject: false,
@@ -339,6 +378,8 @@ const setupVoiceDevice = async () => {
       setLiveCallUI({
         title: "Incoming live call",
         meta: `Caller: ${caller}`,
+        caller,
+        open: true,
         ringing: true,
         canAnswer: true,
         canReject: true,
@@ -354,6 +395,7 @@ const setupVoiceDevice = async () => {
       setLiveCallUI({
         title: "Voice line disconnected",
         meta: error?.message || "Unable to register Twilio voice line.",
+        open: false,
         ringing: false,
         canAnswer: false,
         canReject: false,
@@ -370,6 +412,7 @@ const setupVoiceDevice = async () => {
     setLiveCallUI({
       title: "Voice setup failed",
       meta: error?.message || "Could not start pharmacist voice line.",
+      open: false,
       ringing: false,
       canAnswer: false,
       canReject: false,
@@ -455,37 +498,37 @@ const renderMessages = (messages) => {
 };
 
 const renderCalls = () => {
-  const filter = callStatusFilter.value;
   const filtered = state.calls
-    .filter((call) => (filter === "all" ? true : call.status === filter))
+    .filter((call) => isCallHistoryEntry(call))
     .sort((left, right) => {
-      const leftQueue = Number.isFinite(left.queuePosition) ? left.queuePosition : Number.MAX_SAFE_INTEGER;
-      const rightQueue = Number.isFinite(right.queuePosition) ? right.queuePosition : Number.MAX_SAFE_INTEGER;
-      if (leftQueue !== rightQueue) return leftQueue - rightQueue;
-      return new Date(right.createdAt || 0).getTime() - new Date(left.createdAt || 0).getTime();
+      const leftTime = new Date(left.endedAt || left.updatedAt || left.createdAt || 0).getTime();
+      const rightTime = new Date(right.endedAt || right.updatedAt || right.createdAt || 0).getTime();
+      return rightTime - leftTime;
     });
+
   callsList.innerHTML = "";
+  if (!filtered.length) {
+    const li = document.createElement("li");
+    li.className = "list-item";
+    li.innerHTML = `
+      <div class="title">No completed or missed calls yet</div>
+      <div class="meta">Live incoming calls appear in the full-screen caller interface.</div>
+    `;
+    callsList.appendChild(li);
+    return;
+  }
+
   filtered.forEach((call) => {
     const li = document.createElement("li");
-    li.className = `list-item ${["requested", "queued", "ringing"].includes(call.status) ? "incoming" : ""}`;
+    li.className = "list-item";
     const caller = userNameForCall(call);
-    const queueLabel = call.queuePosition ? ` • Queue #${call.queuePosition}` : "";
+    const outcome = getCallOutcomeLabel(call);
+    const completedAt = formatTime(call.endedAt || call.updatedAt || call.createdAt);
     li.innerHTML = `
-      <div class="title">${caller}${["requested", "queued", "ringing"].includes(call.status) ? '<span class="pill requested">Incoming</span>' : ""}</div>
+      <div class="title">${caller}<span class="pill ${outcome === "Completed" ? "returning" : "requested"}">${outcome}</span></div>
       <div class="meta">${short(call.handoff?.userMessage || "Call request")}</div>
-      <div class="meta">Status: ${call.status || "requested"}${queueLabel} • ${formatTime(call.createdAt)}</div>
-      <div class="call-actions">
-        <button data-action="ringing">Ringing</button>
-        <button data-action="in_progress">In progress</button>
-        <button data-action="completed">Completed</button>
-        <button data-action="cancelled">Cancelled</button>
-      </div>
+      <div class="meta">${outcome} • ${completedAt}</div>
     `;
-    li.querySelectorAll("button").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        await updateCallStatus(call.id, btn.dataset.action);
-      });
-    });
     callsList.appendChild(li);
   });
 };
@@ -529,20 +572,20 @@ const loadCalls = async () => {
   refreshIncomingBadge();
 };
 
-const updateCallStatus = async (callId, status) => {
-  await api(`/calls/${callId}/status`, {
-    method: "POST",
-    body: JSON.stringify({ status })
-  });
-  await loadCalls();
-};
-
 const refreshAll = async () => {
-  await Promise.all([loadSessions(), loadCalls()]);
+  await Promise.all([loadSessions(), loadCalls(), sendPresenceHeartbeat()]);
   if (state.activeSessionId) {
     await loadMessages(state.activeSessionId);
   }
   lastRefresh.textContent = `Last refresh: ${new Date().toLocaleTimeString()}`;
+};
+
+const sendPresenceHeartbeat = async () => {
+  try {
+    await api("/presence/heartbeat", { method: "POST", body: "{}" });
+  } catch (error) {
+    console.warn("Presence heartbeat failed:", error?.message || error);
+  }
 };
 
 messageForm.addEventListener("submit", async (event) => {
@@ -587,6 +630,7 @@ rejectCallBtn.addEventListener("click", () => {
   setLiveCallUI({
     title: "Call declined",
     meta: "Waiting for incoming pharmacist calls from users.",
+    open: false,
     ringing: false,
     canAnswer: false,
     canReject: false,
@@ -638,13 +682,13 @@ resetDataBtn.addEventListener("click", async () => {
 });
 
 refreshBtn.addEventListener("click", refreshAll);
-callStatusFilter.addEventListener("change", renderCalls);
 sessionSearch.addEventListener("input", renderSessions);
 
 setVoiceBadge("Starting voice line…", "");
 setLiveCallUI({
   title: "Live call line is starting…",
   meta: "Fetching Twilio token and registering browser device.",
+  open: false,
   ringing: false,
   canAnswer: false,
   canReject: false,

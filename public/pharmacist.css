@@ -273,34 +273,110 @@ textarea {
 }
 
 .call-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(92px, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.live-call-overlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(160deg, rgba(8, 12, 17, 0.95), rgba(17, 27, 41, 0.94));
+  backdrop-filter: blur(4px);
+  z-index: 1000;
+  padding: 22px;
+}
+
+.live-call-overlay.open {
   display: flex;
-  gap: 6px;
-  margin-top: 8px;
 }
 
-.live-call {
-  border: 1px solid #2a3240;
-  border-radius: 12px;
-  padding: 12px;
-  background: #101621;
-  margin-bottom: 10px;
+.phone-call-ui {
+  width: min(420px, 100%);
+  border: 1px solid #2f3b4d;
+  border-radius: 28px;
+  background: radial-gradient(circle at top, #2a3650 0%, #1a2336 38%, #121926 100%);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  padding: 22px 20px;
+  text-align: center;
 }
 
-.live-call.ringing {
+.live-call-overlay.ringing .phone-call-ui {
   border-color: #f6c955;
-  box-shadow: 0 0 0 1px rgba(246, 201, 85, 0.35);
+  box-shadow: 0 0 0 1px rgba(246, 201, 85, 0.4), 0 22px 52px rgba(0, 0, 0, 0.5);
 }
 
-.live-call .timer {
-  margin-top: 8px;
-  margin-bottom: 2px;
-  font-size: 22px;
-  font-weight: 700;
+.call-state-label {
+  font-size: 12px;
   letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #99a6bb;
+  margin-bottom: 14px;
+}
+
+.caller-avatar {
+  width: 92px;
+  height: 92px;
+  border-radius: 50%;
+  margin: 0 auto 10px;
+  background: linear-gradient(150deg, #31b8c2, #1f7f95);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 30px;
+  color: white;
+}
+
+.live-call-overlay .title {
+  font-weight: 700;
+  font-size: 24px;
+  margin-bottom: 6px;
+}
+
+.live-call-meta {
+  color: #b9c4d6;
+  font-size: 14px;
+  line-height: 1.4;
+  min-height: 40px;
+}
+
+.live-call-overlay .timer {
+  margin-top: 14px;
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   color: #f6f8fb;
 }
 
-.call-actions button.active {
+.call-btn {
+  border-radius: 14px;
+  min-height: 44px;
+}
+
+.call-btn.answer {
+  background: #2f9f63;
+}
+
+.call-btn.answer:hover {
+  background: #34ad6d;
+}
+
+.call-btn.decline,
+.call-btn.hangup {
+  background: #c24343;
+}
+
+.call-btn.decline:hover,
+.call-btn.hangup:hover {
+  background: #d14f4f;
+}
+
+.call-btn.active {
   background: #2b6799;
 }
 
@@ -311,5 +387,9 @@ textarea {
 
   .panel {
     min-height: auto;
+  }
+
+  .call-actions {
+    grid-template-columns: repeat(2, minmax(92px, 1fr));
   }
 }
