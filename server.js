@@ -553,6 +553,58 @@ app.post("/pharmacist/api/calls/:id/status", async (req, res) => {
   }
 });
 
+app.post("/pharmacist/api/calls/:id/callback", async (req, res) => {
+  try {
+    if (!isTwilioConfigured()) {
+      return res.status(500).json({ error: "Twilio Voice not configured." });
+    }
+
+    const { id } = req.params;
+    const sourceRef = firestore.collection(CALLS_COLLECTION).doc(id);
+    const sourceSnapshot = await sourceRef.get();
+    if (!sourceSnapshot.exists) {
+      return res.status(404).json({ error: "Call record not found." });
+    }
+
+    const source = sourceSnapshot.data() || {};
+    const identity = sanitizeIdentity(source.identity || "", "");
+    if (!identity) {
+      return res.status(400).json({ error: "User is not reachable for callback yet." });
+    }
+
+    const callbackRef = firestore.collection(CALLS_COLLECTION).doc();
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    await callbackRef.set({
+      id: callbackRef.id,
+      userId: source.userId || null,
+      callerName: source.callerName || source.userDisplayName || "Unknown caller",
+      callerFirstName: source.callerFirstName || "",
+      callerLastName: source.callerLastName || "",
+      userDisplayName: source.userDisplayName || source.callerName || "Unknown caller",
+      userEmail: source.userEmail || "",
+      identity,
+      handoff: source.handoff || {},
+      direction: "callback",
+      callbackOf: id,
+      status: "ringing",
+      queuePosition: 1,
+      createdAt: now,
+      updatedAt: now
+    });
+
+    return res.json({
+      ok: true,
+      call: {
+        id: callbackRef.id,
+        identity,
+        callerName: source.callerName || source.userDisplayName || "Unknown caller"
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || "Failed to start callback." });
+  }
+});
+
 app.post("/pharmacist/api/admin/reset", async (_req, res) => {
   try {
     const result = await resetPharmacistData();

@@ -9,7 +9,8 @@ const state = {
   callsHydrated: false,
   liveCallStartedAt: null,
   isMuted: false,
-  isOnHold: false
+  isOnHold: false,
+  activeCallUserKey: null
 };
 
 const sessionsList = document.getElementById("sessionsList");
@@ -105,6 +106,9 @@ const userNameForCall = (call) =>
   call.userEmail ||
   (call.userId ? `User ${call.userId.slice(0, 6)}` : "Unknown caller");
 
+const callUserKey = (call) =>
+  call.userId || call.identity || call.userEmail || call.callerName || call.id;
+
 const short = (value, max = 80) => {
   if (!value) return "";
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
@@ -147,6 +151,46 @@ const getCallOutcomeLabel = (call) => {
   if (COMPLETED_CALL_STATUSES.has(status)) return "Completed";
   if (MISSED_CALL_STATUSES.has(status)) return "Missed";
   return "Other";
+};
+
+const buildCallGroups = (calls) => {
+  const groups = new Map();
+  calls.forEach((call) => {
+    if (!isCallHistoryEntry(call)) return;
+    const key = callUserKey(call);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        userId: call.userId || null,
+        identity: call.identity || null,
+        callerName: userNameForCall(call),
+        calls: []
+      });
+    }
+    const group = groups.get(key);
+    group.calls.push(call);
+    if (!group.identity && call.identity) {
+      group.identity = call.identity;
+    }
+    if (group.callerName === "Unknown caller") {
+      group.callerName = userNameForCall(call);
+    }
+  });
+
+  return [...groups.values()]
+    .map((group) => ({
+      ...group,
+      calls: group.calls.sort((left, right) => {
+        const leftTime = new Date(left.endedAt || left.updatedAt || left.createdAt || 0).getTime();
+        const rightTime = new Date(right.endedAt || right.updatedAt || right.createdAt || 0).getTime();
+        return rightTime - leftTime;
+      })
+    }))
+    .sort((left, right) => {
+      const leftTime = new Date(left.calls[0]?.endedAt || left.calls[0]?.updatedAt || left.calls[0]?.createdAt || 0).getTime();
+      const rightTime = new Date(right.calls[0]?.endedAt || right.calls[0]?.updatedAt || right.calls[0]?.createdAt || 0).getTime();
+      return rightTime - leftTime;
+    });
 };
 
 const buildUserSessionCounts = (sessions) => {
@@ -578,16 +622,10 @@ const renderMessages = (messages) => {
 };
 
 const renderCalls = () => {
-  const filtered = state.calls
-    .filter((call) => isCallHistoryEntry(call))
-    .sort((left, right) => {
-      const leftTime = new Date(left.endedAt || left.updatedAt || left.createdAt || 0).getTime();
-      const rightTime = new Date(right.endedAt || right.updatedAt || right.createdAt || 0).getTime();
-      return rightTime - leftTime;
-    });
+  const groups = buildCallGroups(state.calls);
 
   callsList.innerHTML = "";
-  if (!filtered.length) {
+  if (!groups.length) {
     const li = document.createElement("li");
     li.className = "list-item";
     li.innerHTML = `
@@ -598,20 +636,110 @@ const renderCalls = () => {
     return;
   }
 
-  filtered.forEach((call) => {
+  if (!state.activeCallUserKey || !groups.some((group) => group.key === state.activeCallUserKey)) {
+    state.activeCallUserKey = groups[0].key;
+  }
+
+  groups.forEach((group) => {
+    const completedCount = group.calls.filter((call) => getCallOutcomeLabel(call) === "Completed").length;
+    const missedCount = group.calls.filter((call) => getCallOutcomeLabel(call) === "Missed").length;
+    const latestCall = group.calls[0];
+    const latestTime = formatTime(latestCall?.endedAt || latestCall?.updatedAt || latestCall?.createdAt);
+    const isActive = group.key === state.activeCallUserKey;
+
     const li = document.createElement("li");
-    li.className = "list-item";
-    const caller = userNameForCall(call);
-    const outcome = getCallOutcomeLabel(call);
-    const completedAt = formatTime(call.endedAt || call.updatedAt || call.createdAt);
+    li.className = `list-item ${isActive ? "active" : ""}`;
     li.innerHTML = `
-      <div class="title">${caller}<span class="pill ${outcome === "Completed" ? "returning" : "requested"}">${outcome}</span></div>
-      <div class="meta">${short(call.handoff?.userMessage || "Call request")}</div>
-      <div class="meta">${outcome} • ${completedAt}</div>
-      <div class="meta">User must initiate next call from app.</div>
+      <div class="title">${group.callerName}</div>
+      <div class="meta">${group.calls.length} call${group.calls.length === 1 ? "" : "s"} • Completed ${completedCount} • Missed ${missedCount}</div>
+      <div class="meta">Last activity ${latestTime}</div>
     `;
+    li.addEventListener("click", () => {
+      state.activeCallUserKey = group.key;
+      renderCalls();
+    });
+
+    if (isActive) {
+      const history = document.createElement("div");
+      history.className = "call-history-group";
+      group.calls.forEach((call) => {
+        const outcome = getCallOutcomeLabel(call);
+        const completedAt = formatTime(call.endedAt || call.updatedAt || call.createdAt);
+        const row = document.createElement("div");
+        row.className = "call-history-row";
+        row.innerHTML = `
+          <div class="meta"><strong>${outcome}</strong> • ${completedAt}</div>
+          <div class="meta">${short(call.handoff?.userMessage || "Call request")}</div>
+        `;
+
+        if (outcome === "Missed") {
+          const callbackBtn = document.createElement("button");
+          callbackBtn.className = "history-cta";
+          callbackBtn.textContent = "Call back";
+          callbackBtn.disabled = !call.identity || !device;
+          callbackBtn.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            callbackBtn.disabled = true;
+            try {
+              await startCallbackForCall(call);
+            } catch (error) {
+              alert(error?.message || "Unable to start callback.");
+            } finally {
+              callbackBtn.disabled = false;
+            }
+          });
+          row.appendChild(callbackBtn);
+        }
+        history.appendChild(row);
+      });
+      li.appendChild(history);
+    }
+
     callsList.appendChild(li);
   });
+};
+
+const startCallbackForCall = async (call) => {
+  if (!device) {
+    throw new Error("Voice line is not ready yet.");
+  }
+  if (!call.identity) {
+    throw new Error("User is offline for callback. Ask user to open the app and retry.");
+  }
+
+  const payload = await api(`/calls/${call.id}/callback`, {
+    method: "POST",
+    body: "{}"
+  });
+  const callback = payload.call;
+
+  if (activeVoiceCall) {
+    activeVoiceCall.disconnect();
+  }
+
+  setVoiceBadge("Dialing callback…", "incoming");
+  setLiveCallUI({
+    title: "Calling user back",
+    meta: `Connecting to ${callback.callerName || userNameForCall(call)}...`,
+    caller: callback.callerName || userNameForCall(call),
+    open: true,
+    ringing: true,
+    canAnswer: false,
+    canReject: false,
+    canHangup: true,
+    canMute: false,
+    canHold: false
+  });
+
+  const outgoingCall = await device.connect({
+    params: {
+      To: callback.identity,
+      CallerName: "Pharmacist",
+      RequestID: callback.id
+    }
+  });
+  activeVoiceCall = outgoingCall;
+  wireCallLifecycle(outgoingCall, { requestId: callback.id });
 };
 
 const loadSessions = async () => {
@@ -632,6 +760,7 @@ const loadSessions = async () => {
         previousUpdatedAt[session.id] !== state.sessionUpdatedAt[session.id];
       if ((isNew || wasUpdated) && session.id !== state.activeSessionId) {
         void notifyBrowser("New pharmacist chat activity", userNameForSession(session));
+        ringIncoming();
       }
     }
   }
@@ -657,6 +786,7 @@ const loadMessages = async (sessionId) => {
   if (latest && latest.id !== latestActiveSessionMessageId) {
     if (latestActiveSessionMessageId) {
       void notifyBrowser("New user message", short(latest.content || "", 90));
+      ringIncoming();
     }
     latestActiveSessionMessageId = latest.id;
   }
