@@ -53,6 +53,8 @@ let latestActiveSessionMessageId = null;
 
 const COMPLETED_CALL_STATUSES = new Set(["completed"]);
 const MISSED_CALL_STATUSES = new Set(["failed", "cancelled", "missed", "no_answer", "busy", "rejected"]);
+const INCOMING_CALL_STATUSES = new Set(["requested", "queued", "ringing"]);
+const INCOMING_FRESHNESS_MS = 2 * 60 * 1000;
 
 const api = async (path, options = {}) => {
   const response = await fetch(`/pharmacist/api${path}`, {
@@ -151,6 +153,20 @@ const getCallOutcomeLabel = (call) => {
   if (COMPLETED_CALL_STATUSES.has(status)) return "Completed";
   if (MISSED_CALL_STATUSES.has(status)) return "Missed";
   return "Other";
+};
+
+const asTimestamp = (value) => {
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const isFreshIncomingCall = (call) => {
+  const status = String(call?.status || "").toLowerCase();
+  if (!INCOMING_CALL_STATUSES.has(status)) return false;
+  const updatedAt = asTimestamp(call.updatedAt || call.createdAt);
+  if (!updatedAt) return false;
+  return Date.now() - updatedAt <= INCOMING_FRESHNESS_MS;
 };
 
 const buildCallGroups = (calls) => {
@@ -555,7 +571,7 @@ const setupVoiceDevice = async () => {
 };
 
 const refreshIncomingBadge = () => {
-  const requestedCount = state.calls.filter((call) => ["requested", "queued", "ringing"].includes(call.status)).length;
+  const requestedCount = state.calls.filter((call) => isFreshIncomingCall(call)).length;
   const hasVoiceIncoming = Boolean(incomingVoiceCall);
   const totalIncoming = requestedCount + (hasVoiceIncoming ? 1 : 0);
   if (!totalIncoming) {
@@ -680,25 +696,6 @@ const renderCalls = () => {
           <div class="meta"><strong>${outcome}</strong> • ${completedAt}</div>
           <div class="meta">${short(call.handoff?.userMessage || "Call request")}</div>
         `;
-
-        if (outcome === "Missed") {
-          const callbackBtn = document.createElement("button");
-          callbackBtn.className = "history-cta";
-          callbackBtn.textContent = "Call back";
-          callbackBtn.disabled = !call.identity || !device;
-          callbackBtn.addEventListener("click", async (event) => {
-            event.stopPropagation();
-            callbackBtn.disabled = true;
-            try {
-              await startCallbackForCall(call);
-            } catch (error) {
-              alert(error?.message || "Unable to start callback.");
-            } finally {
-              callbackBtn.disabled = false;
-            }
-          });
-          row.appendChild(callbackBtn);
-        }
         history.appendChild(row);
       });
       li.appendChild(history);
@@ -706,49 +703,6 @@ const renderCalls = () => {
 
     callsList.appendChild(li);
   });
-};
-
-const startCallbackForCall = async (call) => {
-  if (!device) {
-    throw new Error("Voice line is not ready yet.");
-  }
-  if (!call.identity) {
-    throw new Error("User is offline for callback. Ask user to open the app and retry.");
-  }
-
-  const payload = await api(`/calls/${call.id}/callback`, {
-    method: "POST",
-    body: "{}"
-  });
-  const callback = payload.call;
-
-  if (activeVoiceCall) {
-    activeVoiceCall.disconnect();
-  }
-
-  setVoiceBadge("Dialing callback…", "incoming");
-  setLiveCallUI({
-    title: "Calling user back",
-    meta: `Connecting to ${callback.callerName || userNameForCall(call)}...`,
-    caller: callback.callerName || userNameForCall(call),
-    open: true,
-    ringing: true,
-    canAnswer: false,
-    canReject: false,
-    canHangup: true,
-    canMute: false,
-    canHold: false
-  });
-
-  const outgoingCall = await device.connect({
-    params: {
-      To: callback.identity,
-      CallerName: "Pharmacist",
-      RequestID: callback.id
-    }
-  });
-  activeVoiceCall = outgoingCall;
-  wireCallLifecycle(outgoingCall, { requestId: callback.id });
 };
 
 const loadSessions = async () => {
