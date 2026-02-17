@@ -207,6 +207,31 @@ function serializeDoc(doc) {
   return { id: doc.id, ...serializeValue(data) };
 }
 
+function timestampToMillis(value) {
+  if (!value) return 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function serializeCallDoc(doc) {
+  const raw = doc.data() || {};
+  const createdAtMs = timestampToMillis(raw.createdAt);
+  const startedAtMs = timestampToMillis(raw.startedAt);
+  const endedAtMs = timestampToMillis(raw.endedAt);
+  const durationSeconds =
+    startedAtMs > 0 && endedAtMs > startedAtMs ? Math.max(0, Math.floor((endedAtMs - startedAtMs) / 1000)) : 0;
+  return {
+    id: doc.id,
+    ...serializeValue(raw),
+    durationSeconds,
+    createdAtMillis: createdAtMs || null,
+    startedAtMillis: startedAtMs || null,
+    endedAtMillis: endedAtMs || null
+  };
+}
+
 function isFirestoreQuotaExceeded(err) {
   const message = String(err?.message || "").toLowerCase();
   return (
@@ -512,6 +537,28 @@ app.get("/pharmacist/api/calls", async (req, res) => {
   }
 });
 
+app.get("/pharmacist/api/calls/ratings-summary", async (_req, res) => {
+  try {
+    const snapshot = await firestore
+      .collection(CALLS_COLLECTION)
+      .limit(500)
+      .get();
+    const ratings = snapshot.docs
+      .map((doc) => doc.data()?.rating)
+      .filter((value) => Number.isFinite(value) && value >= 1 && value <= 5);
+    const totalRatedCalls = ratings.length;
+    const averageRating = totalRatedCalls
+      ? Number((ratings.reduce((sum, value) => sum + value, 0) / totalRatedCalls).toFixed(2))
+      : null;
+    res.json({
+      totalRatedCalls,
+      averageRating
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Failed to load rating summary." });
+  }
+});
+
 app.get("/pharmacist/api/diagnostics", async (_req, res) => {
   try {
     const appRef = admin.app();
@@ -759,6 +806,38 @@ app.post("/twilio/calls/:id/status", ensureFirebase, async (req, res) => {
   }
 });
 
+app.get("/twilio/calls/history", ensureFirebase, async (req, res) => {
+  try {
+    const user = await verifyFirebaseUserFromRequest(req);
+    const snapshot = await firestore
+      .collection(CALLS_COLLECTION)
+      .where("userId", "==", user.uid)
+      .limit(200)
+      .get();
+
+    const calls = snapshot.docs
+      .map(serializeCallDoc)
+      .sort((left, right) => (right.createdAtMillis || 0) - (left.createdAtMillis || 0));
+
+    const ratings = calls
+      .map((call) => call.rating)
+      .filter((value) => Number.isFinite(value) && value >= 1 && value <= 5);
+    const totalCalls = calls.length;
+    const averageRating = ratings.length
+      ? Number((ratings.reduce((sum, value) => sum + value, 0) / ratings.length).toFixed(2))
+      : null;
+
+    return res.json({
+      calls,
+      totalCalls,
+      averageRating
+    });
+  } catch (err) {
+    const statusCode = err?.statusCode || 500;
+    return res.status(statusCode).json({ error: err?.message || "Unable to load call history." });
+  }
+});
+
 app.get("/twilio/calls/:id", ensureFirebase, async (req, res) => {
   try {
     const user = await verifyFirebaseUserFromRequest(req);
@@ -775,6 +854,44 @@ app.get("/twilio/calls/:id", ensureFirebase, async (req, res) => {
   } catch (err) {
     const statusCode = err?.statusCode || 500;
     return res.status(statusCode).json({ error: err?.message || "Unable to load call request." });
+  }
+});
+
+app.post("/twilio/calls/:id/rating", ensureFirebase, async (req, res) => {
+  try {
+    const user = await verifyFirebaseUserFromRequest(req);
+    const { id } = req.params;
+    const rating = Number(req.body?.rating);
+    const feedback = String(req.body?.feedback || "")
+      .trim()
+      .slice(0, 500);
+
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: "Rating must be an integer from 1 to 5." });
+    }
+
+    const callRef = firestore.collection(CALLS_COLLECTION).doc(id);
+    const snapshot = await callRef.get();
+    if (!snapshot.exists) {
+      return res.status(404).json({ error: "Call not found." });
+    }
+
+    const call = snapshot.data() || {};
+    if (call.userId !== user.uid) {
+      return res.status(403).json({ error: "You cannot rate this call." });
+    }
+
+    await callRef.update({
+      rating,
+      ratingFeedback: feedback,
+      ratedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    const statusCode = err?.statusCode || 500;
+    return res.status(statusCode).json({ error: err?.message || "Unable to submit rating." });
   }
 });
 

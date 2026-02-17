@@ -10,6 +10,7 @@ const state = {
   liveCallStartedAt: null,
   isMuted: false,
   isOnHold: false,
+  micReady: false,
   activeCallUserKey: null
 };
 
@@ -25,10 +26,12 @@ const queuePositionInput = document.getElementById("queuePosition");
 const saveStatusBtn = document.getElementById("saveStatus");
 const refreshBtn = document.getElementById("refreshBtn");
 const resetDataBtn = document.getElementById("resetDataBtn");
+const audioPermissionBtn = document.getElementById("audioPermissionBtn");
 const lastRefresh = document.getElementById("lastRefresh");
 const sessionSearch = document.getElementById("sessionSearch");
 const incomingBadge = document.getElementById("incomingBadge");
 const voiceStatusBadge = document.getElementById("voiceStatusBadge");
+const satisfactionBadge = document.getElementById("satisfactionBadge");
 const liveCallCard = document.getElementById("liveCallCard");
 const liveCallAvatar = document.getElementById("liveCallAvatar");
 const liveCallTitle = document.getElementById("liveCallTitle");
@@ -261,6 +264,36 @@ const ringIncoming = () => {
   }
 };
 
+const ensureMicPermission = async () => {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    state.micReady = true;
+    if (audioPermissionBtn) {
+      audioPermissionBtn.disabled = true;
+      audioPermissionBtn.textContent = "Mic ready";
+    }
+    return true;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+    state.micReady = true;
+    if (audioPermissionBtn) {
+      audioPermissionBtn.disabled = true;
+      audioPermissionBtn.textContent = "Mic ready";
+    }
+    return true;
+  } catch (error) {
+    state.micReady = false;
+    if (audioPermissionBtn) {
+      audioPermissionBtn.disabled = false;
+      audioPermissionBtn.textContent = "Enable mic";
+    }
+    setVoiceBadge("Mic permission required", "danger");
+    return false;
+  }
+};
+
 const setVoiceBadge = (text, mode) => {
   voiceStatusBadge.textContent = text;
   voiceStatusBadge.classList.remove("incoming", "danger");
@@ -487,14 +520,7 @@ const setupVoiceDevice = async () => {
   }
 
   try {
-    if (navigator.mediaDevices?.getUserMedia) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        stream.getTracks().forEach((track) => track.stop());
-      } catch (micError) {
-        console.warn("Microphone permission not granted:", micError?.message || micError);
-      }
-    }
+    await ensureMicPermission();
 
     const payload = await api("/twilio/token", { method: "POST", body: "{}" });
     device = new DeviceClass(payload.token, {
@@ -760,7 +786,7 @@ const loadCalls = async () => {
   state.calls = data.calls || [];
 
   const currentRequested = new Set(
-    state.calls.filter((call) => ["requested", "queued", "ringing"].includes(call.status)).map((call) => call.id)
+    state.calls.filter((call) => isFreshIncomingCall(call)).map((call) => call.id)
   );
 
   if (state.callsHydrated) {
@@ -774,6 +800,17 @@ const loadCalls = async () => {
   state.callsHydrated = true;
   renderCalls();
   refreshIncomingBadge();
+};
+
+const loadRatingsSummary = async () => {
+  const payload = await api("/calls/ratings-summary");
+  const avg = payload?.averageRating;
+  const rated = payload?.totalRatedCalls || 0;
+  if (Number.isFinite(avg) && rated > 0) {
+    satisfactionBadge.textContent = `Satisfaction: ${avg.toFixed(2)}/5 (${rated})`;
+  } else {
+    satisfactionBadge.textContent = "Satisfaction: No ratings yet";
+  }
 };
 
 const refreshAll = async () => {
@@ -791,6 +828,9 @@ const refreshAll = async () => {
     }),
     loadCalls().catch((error) => {
       issues.push(`calls: ${error?.message || "failed"}`);
+    }),
+    loadRatingsSummary().catch((error) => {
+      issues.push(`ratings: ${error?.message || "failed"}`);
     }),
     sendPresenceHeartbeat().catch((error) => {
       issues.push(`presence: ${error?.message || "failed"}`);
@@ -856,6 +896,11 @@ saveStatusBtn.addEventListener("click", async () => {
 answerCallBtn.addEventListener("click", async () => {
   if (!incomingVoiceCall) return;
   try {
+    const ready = await ensureMicPermission();
+    if (!ready) {
+      alert("Microphone permission is required to answer calls. Click Enable mic and allow access.");
+      return;
+    }
     await incomingVoiceCall.accept();
   } catch (error) {
     console.error("Failed to accept call:", error);
@@ -928,6 +973,9 @@ resetDataBtn.addEventListener("click", async () => {
 
 refreshBtn.addEventListener("click", refreshAll);
 sessionSearch.addEventListener("input", renderSessions);
+audioPermissionBtn?.addEventListener("click", async () => {
+  await ensureMicPermission();
+});
 
 setVoiceBadge("Starting voice line…", "");
 setLiveCallUI({
