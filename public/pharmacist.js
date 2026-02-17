@@ -471,6 +471,15 @@ const setupVoiceDevice = async () => {
   }
 
   try {
+    if (navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      } catch (micError) {
+        console.warn("Microphone permission not granted:", micError?.message || micError);
+      }
+    }
+
     const payload = await api("/twilio/token", { method: "POST", body: "{}" });
     device = new DeviceClass(payload.token, {
       closeProtection: true,
