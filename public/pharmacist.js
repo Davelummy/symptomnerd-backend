@@ -2,8 +2,10 @@ const state = {
   sessions: [],
   calls: [],
   activeSessionId: null,
+  expandedCallUserKey: null,
   userSessionCounts: {},
   sessionUpdatedAt: {},
+  latestUserMessageBySession: {},
   sessionsHydrated: false,
   requestedCallIds: new Set(),
   callsHydrated: false,
@@ -11,7 +13,7 @@ const state = {
   isMuted: false,
   isOnHold: false,
   micReady: false,
-  activeCallUserKey: null
+  hasPromptedNotificationPermission: false
 };
 
 const sessionsList = document.getElementById("sessionsList");
@@ -52,12 +54,12 @@ let device = null;
 let activeVoiceCall = null;
 let incomingVoiceCall = null;
 const callMeta = new WeakMap();
-let latestActiveSessionMessageId = null;
 
 const COMPLETED_CALL_STATUSES = new Set(["completed"]);
 const MISSED_CALL_STATUSES = new Set(["failed", "cancelled", "missed", "no_answer", "busy", "rejected"]);
 const INCOMING_CALL_STATUSES = new Set(["requested", "queued", "ringing"]);
 const INCOMING_FRESHNESS_MS = 2 * 60 * 1000;
+const MIN_COMPLETED_CALL_SECONDS = 6;
 
 const api = async (path, options = {}) => {
   const response = await fetch(`/pharmacist/api${path}`, {
@@ -85,6 +87,19 @@ const notifyBrowser = async (title, body) => {
     }
     if (Notification.permission === "granted") {
       new Notification(title, { body });
+    }
+  } catch {
+    // Best effort only.
+  }
+};
+
+const primeNotifications = async () => {
+  if (!("Notification" in window)) return;
+  if (state.hasPromptedNotificationPermission) return;
+  state.hasPromptedNotificationPermission = true;
+  try {
+    if (Notification.permission === "default") {
+      await Notification.requestPermission();
     }
   } catch {
     // Best effort only.
@@ -374,7 +389,8 @@ const callerLabelFromCall = (call) => {
 const wireCallLifecycle = (call, options = {}) => {
   const meta = {
     requestId: options.requestId || requestIdFromCall(call),
-    wasConnected: false
+    wasConnected: false,
+    acceptedAtMs: 0
   };
   callMeta.set(call, meta);
 
@@ -388,6 +404,7 @@ const wireCallLifecycle = (call, options = {}) => {
   call.on("accept", () => {
     const current = callMeta.get(call) || meta;
     current.wasConnected = true;
+    current.acceptedAtMs = Date.now();
     callMeta.set(call, current);
     activeVoiceCall = call;
     incomingVoiceCall = null;
@@ -417,6 +434,11 @@ const wireCallLifecycle = (call, options = {}) => {
 
   call.on("disconnect", () => {
     const current = callMeta.get(call) || meta;
+    const connectedSeconds = current.acceptedAtMs
+      ? Math.floor((Date.now() - current.acceptedAtMs) / 1000)
+      : 0;
+    const finalStatus =
+      current.wasConnected && connectedSeconds >= MIN_COMPLETED_CALL_SECONDS ? "completed" : "missed";
     activeVoiceCall = null;
     incomingVoiceCall = null;
     stopLiveTimer();
@@ -434,7 +456,7 @@ const wireCallLifecycle = (call, options = {}) => {
       canHold: false
     });
     if (current.requestId) {
-      void updateCallStatusQuietly(current.requestId, current.wasConnected ? "completed" : "missed");
+      void updateCallStatusQuietly(current.requestId, finalStatus);
     }
     refreshIncomingBadge();
   });
@@ -687,8 +709,8 @@ const renderCalls = () => {
     return;
   }
 
-  if (!state.activeCallUserKey || !groups.some((group) => group.key === state.activeCallUserKey)) {
-    state.activeCallUserKey = groups[0].key;
+  if (state.expandedCallUserKey && !groups.some((group) => group.key === state.expandedCallUserKey)) {
+    state.expandedCallUserKey = null;
   }
 
   groups.forEach((group) => {
@@ -696,21 +718,21 @@ const renderCalls = () => {
     const missedCount = group.calls.filter((call) => getCallOutcomeLabel(call) === "Missed").length;
     const latestCall = group.calls[0];
     const latestTime = formatTime(latestCall?.endedAt || latestCall?.updatedAt || latestCall?.createdAt);
-    const isActive = group.key === state.activeCallUserKey;
+    const isExpanded = group.key === state.expandedCallUserKey;
 
     const li = document.createElement("li");
-    li.className = `list-item ${isActive ? "active" : ""}`;
+    li.className = `list-item ${isExpanded ? "active" : ""}`;
     li.innerHTML = `
       <div class="title">${group.callerName}</div>
       <div class="meta">${group.calls.length} call${group.calls.length === 1 ? "" : "s"} • Completed ${completedCount} • Missed ${missedCount}</div>
       <div class="meta">Last activity ${latestTime}</div>
     `;
     li.addEventListener("click", () => {
-      state.activeCallUserKey = group.key;
+      state.expandedCallUserKey = state.expandedCallUserKey === group.key ? null : group.key;
       renderCalls();
     });
 
-    if (isActive) {
+    if (isExpanded) {
       const history = document.createElement("div");
       history.className = "call-history-group";
       group.calls.forEach((call) => {
@@ -742,16 +764,20 @@ const loadSessions = async () => {
   );
 
   if (state.sessionsHydrated) {
+    const updatedNonActiveSessionIds = [];
     for (const session of state.sessions) {
       const isNew = !previousIds.has(session.id);
       const wasUpdated =
         previousUpdatedAt[session.id] &&
         previousUpdatedAt[session.id] !== state.sessionUpdatedAt[session.id];
-      if ((isNew || wasUpdated) && session.id !== state.activeSessionId) {
-        void notifyBrowser("New pharmacist chat activity", userNameForSession(session));
+      if (isNew) {
+        void notifyBrowser("New pharmacist chat", userNameForSession(session));
         ringIncoming();
+      } else if (wasUpdated && session.id !== state.activeSessionId) {
+        updatedNonActiveSessionIds.push(session.id);
       }
     }
+    await Promise.all(updatedNonActiveSessionIds.map((sessionId) => loadMessages(sessionId, { render: false, notify: true })));
   }
   state.sessionsHydrated = true;
 
@@ -767,18 +793,29 @@ const loadSessions = async () => {
   }
 };
 
-const loadMessages = async (sessionId) => {
+const loadMessages = async (sessionId, options = {}) => {
+  const { render = true, notify = false } = options;
   const data = await api(`/sessions/${sessionId}/messages`);
   const messages = data.messages || [];
-  renderMessages(messages);
+  if (render) {
+    renderMessages(messages);
+  }
   const latest = [...messages].reverse().find((message) => message.role === "user");
-  if (latest && latest.id !== latestActiveSessionMessageId) {
-    if (latestActiveSessionMessageId) {
+  const previous = state.latestUserMessageBySession[sessionId] || null;
+  if (latest?.id) {
+    const isNewMessage = latest.id !== previous;
+    if (notify && isNewMessage && previous) {
+      void notifyBrowser("New user message", short(latest.content || "", 90));
+      ringIncoming();
+    } else if (notify && isNewMessage && !previous) {
       void notifyBrowser("New user message", short(latest.content || "", 90));
       ringIncoming();
     }
-    latestActiveSessionMessageId = latest.id;
+    state.latestUserMessageBySession[sessionId] = latest.id;
+  } else {
+    delete state.latestUserMessageBySession[sessionId];
   }
+  return messages;
 };
 
 const loadCalls = async () => {
@@ -976,6 +1013,9 @@ sessionSearch.addEventListener("input", renderSessions);
 audioPermissionBtn?.addEventListener("click", async () => {
   await ensureMicPermission();
 });
+document.addEventListener("click", () => {
+  void primeNotifications();
+}, { once: true });
 
 setVoiceBadge("Starting voice line…", "");
 setLiveCallUI({

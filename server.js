@@ -281,6 +281,20 @@ const PRESENCE_COLLECTION = "pharmacist_presence";
 const ACTIVE_CALL_STATUSES = ["requested", "queued", "ringing", "in_progress"];
 const TERMINAL_CALL_STATUSES = new Set(["completed", "failed", "cancelled", "missed"]);
 const USER_UPDATABLE_CALL_STATUSES = new Set(["ringing", "in_progress", "completed", "failed", "cancelled", "missed"]);
+const MISSED_LIKE_CALL_STATUSES = new Set(["failed", "cancelled", "missed", "no_answer", "busy", "rejected"]);
+
+function shouldApplyCallStatusTransition(currentStatus, nextStatus) {
+  const from = String(currentStatus || "").toLowerCase();
+  const to = String(nextStatus || "").toLowerCase();
+  if (!to) return false;
+  if (!from) return true;
+
+  // Do not overwrite a missed/failed outcome with completed.
+  if (MISSED_LIKE_CALL_STATUSES.has(from) && to === "completed") {
+    return false;
+  }
+  return true;
+}
 
 function parseCallerNameParts(fullName) {
   const pieces = String(fullName || "")
@@ -581,6 +595,12 @@ app.post("/pharmacist/api/calls/:id/status", async (req, res) => {
   try {
     const { id } = req.params;
     const status = req.body?.status || "in_progress";
+    const callRef = firestore.collection(CALLS_COLLECTION).doc(id);
+    const snapshot = await callRef.get();
+    const current = snapshot.data() || {};
+    if (!shouldApplyCallStatusTransition(current.status, status)) {
+      return res.json({ ok: true, ignored: true });
+    }
     const update = {
       status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -592,7 +612,7 @@ app.post("/pharmacist/api/calls/:id/status", async (req, res) => {
       update.endedAt = admin.firestore.FieldValue.serverTimestamp();
       update.queuePosition = null;
     }
-    await firestore.collection(CALLS_COLLECTION).doc(id).update(update);
+    await callRef.update(update);
     await rebalanceCallQueue();
     res.json({ ok: true });
   } catch (err) {
@@ -782,6 +802,9 @@ app.post("/twilio/calls/:id/status", ensureFirebase, async (req, res) => {
     const current = snapshot.data() || {};
     if (current.userId !== user.uid) {
       return res.status(403).json({ error: "You cannot update this call request." });
+    }
+    if (!shouldApplyCallStatusTransition(current.status, status)) {
+      return res.json({ ok: true, ignored: true });
     }
 
     const update = {
