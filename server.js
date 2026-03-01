@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import pg from "pg";
 import admin from "firebase-admin";
@@ -9,9 +10,45 @@ import { fileURLToPath } from "url";
 
 dotenv.config();
 
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : [];
+
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (native iOS app, curl, Render health checks)
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("CORS: origin not allowed"));
+    },
+    credentials: true
+  })
+);
 app.use(express.json({ limit: "1mb" }));
+
+const aiRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later." }
+});
+
+const generalRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later." }
+});
+
+app.use("/ai/", aiRateLimit);
+app.use("/twilio/", generalRateLimit);
+app.use("/pharmacist/api/", generalRateLimit);
 
 const { Pool } = pg;
 
@@ -1411,9 +1448,10 @@ function buildFallbackFromPayload(payload) {
   };
 }
 
-app.post("/ai/analyze", async (req, res) => {
+app.post("/ai/analyze", ensureFirebase, async (req, res) => {
   let payload;
   try {
+    await verifyFirebaseUserFromRequest(req);
     payload = buildUserPayload(req.body.request);
     let result;
     if (AI_PROVIDER === "gemini") {
@@ -1454,9 +1492,10 @@ app.post("/ai/analyze", async (req, res) => {
   }
 });
 
-app.post("/ai/chat", async (req, res) => {
+app.post("/ai/chat", ensureFirebase, async (req, res) => {
   let payload;
   try {
+    await verifyFirebaseUserFromRequest(req);
     payload = buildUserPayload(req.body.request);
     const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
     const trimmedMessages = messages.slice(-6);
